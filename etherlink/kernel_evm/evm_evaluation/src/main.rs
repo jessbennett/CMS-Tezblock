@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2023 Functori <contact@functori.com>
+// SPDX-FileCopyrightText: 2023-2024 Functori <contact@functori.com>
 //
 // SPDX-License-Identifier: MIT
 
@@ -8,10 +8,11 @@ mod helpers;
 mod models;
 mod runner;
 
+use models::SkipData;
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{read_to_string, File, OpenOptions},
+    fs::{read, read_to_string, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -20,6 +21,8 @@ use walkdir::{DirEntry, WalkDir};
 
 use fillers::TestResult;
 use helpers::{construct_folder_path, OutputOptions};
+
+pub const SKIP_DATA_FILE: &str = "skip_data.yml";
 
 pub fn find_all_json_tests(path: &Path) -> Vec<PathBuf> {
     WalkDir::new(path)
@@ -90,10 +93,23 @@ pub struct Opt {
     result: bool,
     #[structopt(long = "diff", about = "Compare result with a former evaluation.")]
     diff: Option<String>,
+    #[structopt(
+        long = "resources",
+        default_value = "./etherlink/kernel_evm/evm_evaluation/resources",
+        about = "Specify the path where the tool needs to retrieve its resources from."
+    )]
+    resources: String,
+    #[structopt(
+        short = "c",
+        long = "ci-mode",
+        about = "This argument is useful for the CI so the tool can act as a \
+                 non-regression job."
+    )]
+    ci_mode: bool,
 }
 
 fn generate_final_report(
-    output_file: &mut File,
+    output_file: &mut Option<File>,
     report_map: &mut HashMap<String, ReportValue>,
 ) {
     let mut successes_total = 0;
@@ -116,7 +132,7 @@ fn generate_final_report(
                 let entry = if report_value.skipped == 0 {
                     "Fully Successful Tests"
                 } else {
-                    "Fully Successful Unskipped Tests"
+                    "Fully Successful With Skipped Tests"
                 };
                 final_report
                     .entry(entry)
@@ -154,6 +170,8 @@ fn generate_final_report(
                     .or_insert_with(|| vec![insert_element]);
             } else if key == "stPreCompiledContracts"
                 || key == "stPreCompiledContracts2"
+                || key == "stZeroKnowledge"
+                || key == "stZeroKnowledge2"
                 || key == "stStaticFlagEnabled"
             {
                 final_report
@@ -213,15 +231,13 @@ fn generate_final_report(
                         section_elems.push(insert_element.clone())
                     })
                     .or_insert_with(|| vec![insert_element]);
-            } else if key == "stZeroKnowledge"
-                || key == "stZeroKnowledge2"
-                || key == "stHomesteadSpecific"
+            } else if key == "stHomesteadSpecific"
                 || key == "stCallDelegateCodesCallCodeHomestead"
                 || key == "stCallDelegateCodesHomestead"
                 || key == "stDelegatecallTestHomestead"
             {
                 final_report
-                    .entry("Investigation/Suspended")
+                    .entry("Homestead EIPs")
                     .and_modify(|section_elems| {
                         section_elems.push(insert_element.clone())
                     })
@@ -237,31 +253,34 @@ fn generate_final_report(
         }
     }
 
-    writeln!(output_file, "@========= FINAL REPORT =========@").unwrap();
+    write_out!(output_file, "@========= FINAL REPORT =========@");
 
     for (section, items) in final_report {
-        writeln!(output_file, "\n••• {} •••\n", section).unwrap();
+        write_out!(output_file, "\n••• {} •••\n", section);
         for (key, successes, failures, skipped) in items {
             let skipped_msg = if skipped == 0 {
                 String::new()
             } else {
                 format!(" with {} test(s) skipped", skipped)
             };
-            writeln!(
+            write_out!(
                 output_file,
                 "For sub-dir {}, there was(were) {} success(es) and {} failure(s){}.",
-                key, successes, failures, skipped_msg
-            )
-            .unwrap();
+                key,
+                successes,
+                failures,
+                skipped_msg
+            );
         }
     }
 
-    writeln!(
+    write_out!(
         output_file,
         "\nSUCCESSES IN TOTAL: {}\nFAILURES IN TOTAL: {}\nSKIPPED IN TOTAL: {}",
-        successes_total, failure_total, skipped_total
-    )
-    .unwrap();
+        successes_total,
+        failure_total,
+        skipped_total
+    );
 }
 
 fn load_former_result(path: &str) -> HashMap<String, (TestResult, Option<TestResult>)> {
@@ -279,7 +298,7 @@ fn load_former_result(path: &str) -> HashMap<String, (TestResult, Option<TestRes
 }
 
 fn generate_diff(
-    output_file: &mut File,
+    output_file: &mut Option<File>,
     diff_result_map: &HashMap<String, (TestResult, Option<TestResult>)>,
 ) {
     let mut empty = true;
@@ -288,23 +307,24 @@ fn generate_diff(
         match new_res {
             None => {
                 empty = false;
-                writeln!(output_file, "{}: UNPROCESSED", test_case).unwrap()
+                write_out!(output_file, "{}: UNPROCESSED", test_case)
             }
             Some(result) if former_res != result => {
                 empty = false;
-                writeln!(
+                write_out!(
                     output_file,
                     "{}: {:?} -> {:?}",
-                    test_case, former_res, result
+                    test_case,
+                    former_res,
+                    result
                 )
-                .unwrap()
             }
             _ => continue,
         }
     }
 
     if empty {
-        writeln!(output_file, "None of the test evaluation was changed.").unwrap()
+        write_out!(output_file, "None of the test evaluation was changed.")
     }
 }
 
@@ -313,27 +333,54 @@ pub fn check_skip(test_file_path: &Path) -> bool {
 
     matches!(
         file_name,
+        // Long tests (all passing)
+        | "CALLBlake2f_MaxRounds.json" // ✔
+        | "loopMul.json" // ✔
+
         // Reason: chainId is tested for ethereum mainnet (1) not for etherlink (1337)
         | "chainId.json"
 
-        // The following test(s) is/are failing they need in depth debugging
-        // Reason: memory allocation of X bytes failed | 73289 IOT instruction (core dumped)
-        | "sha3.json"
+        // Reason: EIP-2930 (https://eips.ethereum.org/EIPS/eip-2930) concerns optional
+        // access lists and we don't intend to implement them for now
+        | "addressOpcodes.json"
+        | "coinbaseT01.json"
+        | "coinbaseT2.json"
+        | "manualCreate.json"
+        | "storageCosts.json"
+        | "transactionCosts.json"
+        | "variedContext.json"
 
-        // Long tests ✔ (passing)
-        | "loopMul.json"
+        // Reason: those test the refund mechanism
+        // see https://gitlab.com/tezos/tezos/-/merge_requests/11835
+        | "refund_getEtherBack.json"
+        | "refund50_2.json"
+        | "refundSSTORE.json"
+        | "refund50_1.json"
+        | "refund_NoOOG_1.json"
+        | "refund_CallA.json"
+        | "refund50percentCap.json"
+        | "refund600.json"
 
-        // Oddly long checks on a test that do no relevant check (passing)
-        | "intrinsic.json"
+        // SKIPPED BECAUSE TESTS ARE EXPECTED TO BE RUNNED VIA AN EXTERNAL CLIENT
 
-        // Long tests ~ (outcome is unknown)
-        | "static_Call50000_sha256.json"
-        | "static_Call50000_ecrec.json"
-        | "static_Call50000.json"
+        // Reason: Invalid transaction. The gas limit is set to less than 21000.
+        // These transactions are usually handled at the client level and directly rejected.
+        // Moreover, if we comply to what's expected by the test we'd remove the balance
+        // but the test is waiting for the nonce to stay untouched, this opens a clear
+        // possibility of potential replay attacks.
+        | "invalidTr.json"
 
-        // Reason: this test rely on hot/cold access and as of right now
-        // this feature will not be part of Etherlink
-        | "sloadGasCost.json"
+        // Reason: The gas price is computed with max_fee_per_gas. But max_fee_per_gas 
+        // is used when you don't know the base fee. Usually the client verifies if the 
+        // account has enough funds to pay the max gas price (computed with max_fee_per_gas)
+        // and if that isn't the case then the client directly rejects the transaction.
+        // But in the kernel we know the real gas price because we have a base fee.
+        // Therefore, the test does not pass because it checks if the account has enough funds, 
+        // which it doesn't, but with the known base fee the account does have enough funds 
+        // and the test should pass.
+        // max_gas_price = max_fee_per_gas x gas_limit
+        // real_gas_price = (base_fee + max_priority_fee_per_gas) x gas_limit
+        | "transactionIntinsicBug.json"
     )
 }
 
@@ -426,7 +473,7 @@ pub fn check_skip_parsing(test_file_path: &Path) -> bool {
 
 fn process_skip(
     output: &OutputOptions,
-    output_file: &mut File,
+    output_file: &mut Option<File>,
     report_map: &mut ReportMap,
     report_key: &str,
 ) {
@@ -439,7 +486,7 @@ fn process_skip(
             };
         });
     if output.log {
-        writeln!(output_file, "\nSKIPPED\n").unwrap()
+        write_out!(output_file, "\nSKIPPED\n")
     };
 }
 
@@ -453,13 +500,19 @@ pub fn main() {
         _ => "evm_evaluation.regression",
     };
 
-    let mut output_file = OpenOptions::new()
-        .write(true)
-        .append(!(opt.from_scratch || opt.result || diff))
-        .truncate(opt.from_scratch || opt.result || diff)
-        .create(true)
-        .open(output_name)
-        .unwrap();
+    let mut output_file = if cfg!(not(feature = "disable-file-logs")) {
+        Some(
+            OpenOptions::new()
+                .write(true)
+                .append(!(opt.from_scratch || opt.result || diff))
+                .truncate(opt.from_scratch || opt.result || diff)
+                .create(true)
+                .open(output_name)
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     let folder_path =
         construct_folder_path("GeneralStateTests", &opt.eth_tests, &opt.sub_dir);
     let test_files = find_all_json_tests(&folder_path);
@@ -474,13 +527,24 @@ pub fn main() {
     };
 
     if output.log {
-        writeln!(
+        write_out!(
             output_file,
             "Start running tests on: {}",
             folder_path.to_str().unwrap()
-        )
-        .unwrap();
+        );
     }
+
+    let skip_data_path = Path::new(&opt.resources).join(SKIP_DATA_FILE);
+    let skip_data: SkipData = match read(&skip_data_path) {
+        Ok(reader) => serde_yaml::from_reader(&*reader)
+            .expect("Reading data(s) to skip should succeed."),
+        Err(_) => {
+            write_out!(output_file, "WARNING: the specified path [{}] can not be found, data(s) \
+                                   that should be skipped will not be and the outcome of the \
+                                   evaluation could be erroneous.", skip_data_path.display());
+            SkipData { datas: vec![] }
+        }
+    };
 
     for test_file in test_files.into_iter() {
         let splitted_path: Vec<&str> = test_file.to_str().unwrap().split('/').collect();
@@ -501,8 +565,7 @@ pub fn main() {
         };
 
         if output.log {
-            writeln!(output_file, "---------- Test: {:?} ----------", &test_file)
-                .unwrap();
+            write_out!(output_file, "---------- Test: {:?} ----------", &test_file);
         }
 
         if check_skip_parsing(&test_file) {
@@ -526,12 +589,13 @@ pub fn main() {
             skip,
             &mut diff_result_map,
             &output,
+            &skip_data,
         )
         .unwrap();
     }
 
     if output.log {
-        writeln!(output_file, "@@@@@ END OF TESTING @@@@@\n").unwrap();
+        write_out!(output_file, "@@@@@ END OF TESTING @@@@@\n");
     }
 
     if let Some(map) = diff_result_map {

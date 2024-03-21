@@ -271,7 +271,9 @@ let rpc_host sc_node = sc_node.persistent_state.rpc_host
 let rpc_port sc_node = sc_node.persistent_state.rpc_port
 
 let metrics node =
-  ( Option.value ~default:"127.0.0.1" node.persistent_state.metrics_addr,
+  ( Option.value
+      ~default:Constant.default_host
+      node.persistent_state.metrics_addr,
     node.persistent_state.metrics_port )
 
 let endpoint sc_node =
@@ -471,10 +473,10 @@ let handle_event sc_node {name; value; timestamp = _} =
   | _ -> ()
 
 let create_with_endpoint ?runner ?path ?name ?color ?data_dir ~base_dir
-    ?event_pipe ?metrics_addr ?metrics_port ?(rpc_host = "127.0.0.1") ?rpc_port
-    ?(operators = []) ?default_operator ?(dal_node : Dal_node.t option)
-    ?loser_mode ?(allow_degraded = false) ?(gc_frequency = 1)
-    ?(history_mode = Full) ?password_file mode endpoint =
+    ?event_pipe ?metrics_addr ?metrics_port ?(rpc_host = Constant.default_host)
+    ?rpc_port ?(operators = []) ?default_operator
+    ?(dal_node : Dal_node.t option) ?loser_mode ?(allow_degraded = false)
+    ?(gc_frequency = 1) ?(history_mode = Full) ?password_file mode endpoint =
   let name = match name with None -> fresh_name () | Some name -> name in
   let data_dir =
     match data_dir with None -> Temp.dir name | Some dir -> dir
@@ -620,7 +622,8 @@ let dump_durable_storage ~sc_rollup_node ~dump ?(block = "head") () =
   let process = spawn_command sc_rollup_node cmd in
   Process.check process
 
-let export_snapshot ?(compress_on_the_fly = false) sc_rollup_node dir =
+let export_snapshot ?(compress_on_the_fly = false) ?(compact = false)
+    sc_rollup_node dir =
   let process =
     spawn_command
       sc_rollup_node
@@ -632,7 +635,8 @@ let export_snapshot ?(compress_on_the_fly = false) sc_rollup_node dir =
          "--data-dir";
          data_dir sc_rollup_node;
        ]
-      @ Cli_arg.optional_switch "compress-on-the-fly" compress_on_the_fly)
+      @ Cli_arg.optional_switch "compress-on-the-fly" compress_on_the_fly
+      @ Cli_arg.optional_switch "compact" compact)
   in
   let parse process =
     let* output = Process.check_and_read_stdout process in

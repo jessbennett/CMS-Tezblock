@@ -42,11 +42,12 @@ let config_init_command =
   command
     ~group
     ~desc:"Configure the smart rollup node."
-    (args23
+    (args24
        force_switch
        data_dir_arg
        rpc_addr_arg
        rpc_port_arg
+       acl_override_arg
        metrics_addr_arg
        loser_mode_arg
        reconnection_delay_arg
@@ -75,6 +76,7 @@ let config_init_command =
            data_dir,
            rpc_addr,
            rpc_port,
+           acl_override,
            metrics_addr,
            loser_mode,
            reconnection_delay,
@@ -102,6 +104,7 @@ let config_init_command =
         Configuration.Cli.configuration_from_args
           ~rpc_addr
           ~rpc_port
+          ~acl_override
           ~metrics_addr
           ~loser_mode
           ~reconnection_delay
@@ -140,64 +143,69 @@ let legacy_run_command =
   command
     ~group
     ~desc:"Run the rollup node daemon (deprecated)."
-    (args25
-       data_dir_arg
-       mode_arg
-       sc_rollup_address_arg
-       rpc_addr_arg
-       rpc_port_arg
-       metrics_addr_arg
-       loser_mode_arg
-       reconnection_delay_arg
-       dal_node_endpoint_arg
-       dac_observer_endpoint_arg
-       dac_timeout_arg
-       pre_images_endpoint_arg
-       injector_retention_period_arg
-       injector_attempts_arg
-       injection_ttl_arg
-       index_buffer_size_arg
-       index_buffer_size_arg
-       log_kernel_debug_arg
-       log_kernel_debug_file_arg
-       boot_sector_file_arg
-       no_degraded_arg
-       gc_frequency_arg
-       history_mode_arg
-       cors_allowed_origins_arg
-       cors_allowed_headers_arg)
+    (merge_options
+       (args7
+          data_dir_arg
+          mode_arg
+          sc_rollup_address_arg
+          rpc_addr_arg
+          rpc_port_arg
+          acl_override_arg
+          metrics_addr_arg)
+       (args19
+          loser_mode_arg
+          reconnection_delay_arg
+          dal_node_endpoint_arg
+          dac_observer_endpoint_arg
+          dac_timeout_arg
+          pre_images_endpoint_arg
+          injector_retention_period_arg
+          injector_attempts_arg
+          injection_ttl_arg
+          index_buffer_size_arg
+          index_buffer_size_arg
+          log_kernel_debug_arg
+          log_kernel_debug_file_arg
+          boot_sector_file_arg
+          no_degraded_arg
+          gc_frequency_arg
+          history_mode_arg
+          cors_allowed_origins_arg
+          cors_allowed_headers_arg))
     (prefixes ["run"] @@ stop)
-    (fun ( data_dir,
-           mode,
-           sc_rollup_address,
-           rpc_addr,
-           rpc_port,
-           metrics_addr,
-           loser_mode,
-           reconnection_delay,
-           dal_node_endpoint,
-           dac_observer_endpoint,
-           dac_timeout,
-           pre_images_endpoint,
-           injector_retention_period,
-           injector_attempts,
-           injection_ttl,
-           index_buffer_size,
-           irmin_cache_size,
-           log_kernel_debug,
-           log_kernel_debug_file,
-           boot_sector_file,
-           no_degraded,
-           gc_frequency,
-           history_mode,
-           allowed_origins,
-           allowed_headers )
+    (fun ( ( data_dir,
+             mode,
+             sc_rollup_address,
+             rpc_addr,
+             rpc_port,
+             acl_override,
+             metrics_addr ),
+           ( loser_mode,
+             reconnection_delay,
+             dal_node_endpoint,
+             dac_observer_endpoint,
+             dac_timeout,
+             pre_images_endpoint,
+             injector_retention_period,
+             injector_attempts,
+             injection_ttl,
+             index_buffer_size,
+             irmin_cache_size,
+             log_kernel_debug,
+             log_kernel_debug_file,
+             boot_sector_file,
+             no_degraded,
+             gc_frequency,
+             history_mode,
+             allowed_origins,
+             allowed_headers ) )
          cctxt ->
       let* configuration =
         Configuration.Cli.create_or_read_config
           ~data_dir
           ~rpc_addr
           ~rpc_port
+          ~acl_override
           ~metrics_addr
           ~loser_mode
           ~reconnection_delay
@@ -238,10 +246,11 @@ let run_command =
     ~desc:
       "Run the rollup node daemon. Arguments overwrite values provided in the \
        configuration file."
-    (args23
+    (args24
        data_dir_arg
        rpc_addr_arg
        rpc_port_arg
+       acl_override_arg
        metrics_addr_arg
        loser_mode_arg
        reconnection_delay_arg
@@ -269,6 +278,7 @@ let run_command =
     (fun ( data_dir,
            rpc_addr,
            rpc_port,
+           acl_override,
            metrics_addr,
            loser_mode,
            reconnection_delay,
@@ -298,6 +308,7 @@ let run_command =
           ~data_dir
           ~rpc_addr
           ~rpc_port
+          ~acl_override
           ~metrics_addr
           ~loser_mode
           ~reconnection_delay
@@ -384,8 +395,8 @@ let dump_durable_storage =
       | Error errs -> cctxt#error "%a" pp_print_trace errs)
 
 let export_snapshot
-    (data_dir, dest, no_checks, compress_on_the_fly, uncompressed) filename
-    (cctxt : Client_context.full) =
+    (data_dir, dest, no_checks, compress_on_the_fly, uncompressed, compact)
+    filename (cctxt : Client_context.full) =
   let open Lwt_result_syntax in
   let*! compression =
     match (compress_on_the_fly, uncompressed) with
@@ -396,7 +407,9 @@ let export_snapshot
     | false, true -> Lwt.return Snapshots.No
   in
   let* snapshot_file =
-    Snapshots.export ~no_checks ~compression ~data_dir ~dest ~filename
+    if compact then
+      Snapshots.export_compact ~compression ~data_dir ~dest ~filename
+    else Snapshots.export ~no_checks ~compression ~data_dir ~dest ~filename
   in
   let*! () = cctxt#message "Snapshot exported to %s@." snapshot_file in
   return_unit
@@ -406,12 +419,13 @@ let export_snapshot_auto_name =
   command
     ~group
     ~desc:"Export a snapshot of the rollup node state."
-    (args5
+    (args6
        data_dir_arg
        Cli.snapshot_dir_arg
        Cli.no_checks_arg
        Cli.compress_on_the_fly_arg
-       Cli.uncompressed)
+       Cli.uncompressed
+       Cli.compact)
     (prefixes ["snapshot"; "export"] @@ stop)
     (fun params cctxt -> export_snapshot params None cctxt)
 
@@ -420,15 +434,18 @@ let export_snapshot_named =
   command
     ~group
     ~desc:"Export a snapshot of the rollup node state to a given file."
-    (args4
+    (args5
        data_dir_arg
        Cli.no_checks_arg
        Cli.compress_on_the_fly_arg
-       Cli.uncompressed)
+       Cli.uncompressed
+       Cli.compact)
     (prefixes ["snapshot"; "export"] @@ Cli.snapshot_file_param @@ stop)
-    (fun (data_dir, no_checks, compress_on_the_fly, uncompressed) filename cctxt ->
+    (fun (data_dir, no_checks, compress_on_the_fly, uncompressed, compact)
+         filename
+         cctxt ->
       export_snapshot
-        (data_dir, None, no_checks, compress_on_the_fly, uncompressed)
+        (data_dir, None, no_checks, compress_on_the_fly, uncompressed, compact)
         (Some filename)
         cctxt)
 

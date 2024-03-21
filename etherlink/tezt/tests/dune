@@ -6,20 +6,22 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   tezt.core
+  octez-libs.test-helpers
   octez-libs.tezt-wrapper
   tezt-tezos
-  tezt_ethereum
+  tezt_etherlink
   tezos-protocol-alpha.protocol)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
   -open Tezt_core
   -open Tezt_core.Base
+  -open Tezos_test_helpers
   -open Tezt_wrapper
   -open Tezt_wrapper.Base
   -open Tezt_tezos
   -open Tezt_tezos.Runnable.Syntax
-  -open Tezt_ethereum)
+  -open Tezt_etherlink)
  (modules evm_rollup evm_sequencer))
 
 (executable
@@ -37,7 +39,11 @@
 (rule
  (alias runtest)
  (package tezt-etherlink)
- (deps etherlink/tezt/tests/evm_kernel_inputs)
+ (deps
+  (glob_files evm_kernel_inputs/*)
+  (glob_files ../../tezos_contracts/*)
+  (glob_files ../../config/*)
+  (glob_files_rec ../../kernel_evm/*))
  (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
  (action (run %{dep:./main.exe})))
 

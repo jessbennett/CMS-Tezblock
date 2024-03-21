@@ -50,12 +50,6 @@ pub mod constants {
     /// The minimum amount of gas for an ethereum transaction.
     pub const BASE_GAS: u64 = crate::CONFIG.gas_transaction_call;
 
-    /// The maximum gas limit allowed for a transaction. We need to set a limit
-    /// on the gas so we can consider the transaction in a reboot. If we don't
-    /// set a limit, we could reboot again and again until the transaction
-    /// fits in a reboot, which will never happen.
-    pub const MAX_TRANSACTION_GAS_LIMIT: u64 = MAX_ALLOWED_TICKS / TICKS_PER_GAS;
-
     /// Overapproximation of the upper bound of the number of ticks used to
     /// fetch the inbox. Considers an inbox with the size of a full block, and
     /// apply a tick model affine in the size of the inbox.
@@ -106,17 +100,14 @@ pub mod constants {
     pub const TRANSACTION_OVERHEAD_INTERCEPT: u64 = 1_150_000;
     pub const TRANSACTION_OVERHEAD_COEF: u64 = 880;
     pub const TRANSFERT_OBJ_SIZE: u64 = 347;
-}
 
-fn estimate_ticks_for_transaction(transaction: &Transaction) -> u64 {
-    let tx_data_size = transaction.data_size();
-    match &transaction.content {
-        crate::inbox::TransactionContent::Deposit(_) => constants::TICKS_FOR_DEPOSIT,
-        crate::inbox::TransactionContent::Ethereum(eth) => {
-            average_ticks_of_gas(eth.execution_gas_limit())
-                .saturating_add(ticks_of_transaction_overhead(tx_data_size))
-        }
-    }
+    /// Those values are completely arbitrary and do not reflect reality
+    pub const TICKS_FOR_BLUEPRINT_CHUNK_SIGNATURE: u64 = TICKS_FOR_CRYPTO;
+    pub const TICKS_FOR_INBOX_READ_PER_BYTE: u64 = 1000;
+    pub const TICKS_PER_BYTE_FOR_CHUNK_STORE: u64 = 1000;
+
+    /// Number of ticks used to parse deposits
+    pub const TICKS_PER_DEPOSIT_PARSING: u64 = 1_500_000;
 }
 
 /// Estimation of the number of ticks the kernel can safely spend in the
@@ -130,13 +121,6 @@ pub fn estimate_remaining_ticks_for_transaction_execution(
         .saturating_sub(ticks)
 }
 
-/// Estimation of the number of ticks it takes to execute a given amount of gas.
-/// Takes into account the crypto, but not the overheads of a transaction, such
-/// as registering a valid transaction.
-pub fn average_ticks_of_gas(gas: u64) -> u64 {
-    gas.saturating_mul(constants::TICKS_PER_GAS)
-}
-
 /// Estimation of the number of ticks used up for executing a transaction
 /// besides executing the opcodes.
 fn ticks_of_transaction_overhead(tx_data_size: u64) -> u64 {
@@ -146,12 +130,6 @@ fn ticks_of_transaction_overhead(tx_data_size: u64) -> u64 {
     tx_obj_size
         .saturating_mul(constants::TRANSACTION_OVERHEAD_COEF)
         .saturating_add(constants::TRANSACTION_OVERHEAD_INTERCEPT)
-}
-
-/// Check that a transaction can fit inside the tick limit
-pub fn estimate_would_overflow(estimated_ticks: u64, transaction: &Transaction) -> bool {
-    estimate_ticks_for_transaction(transaction).saturating_add(estimated_ticks)
-        > constants::MAX_ALLOWED_TICKS
 }
 
 /// An invalid transaction could not be transmitted to the VM, eg. the nonce
@@ -170,13 +148,15 @@ pub fn ticks_of_valid_transaction(
     transaction: &Transaction,
     resulting_ticks: u64,
 ) -> u64 {
+    use crate::inbox::TransactionContent::*;
+
     match &transaction.content {
-        crate::inbox::TransactionContent::Ethereum(_) => {
+        Ethereum(_) | EthereumDelayed(_) => {
             ticks_of_valid_transaction_ethereum(resulting_ticks, transaction.data_size())
         }
         // Ticks are already spent during the validation of the transaction (see
         // apply.rs).
-        crate::inbox::TransactionContent::Deposit(_) => resulting_ticks,
+        Deposit(_) => resulting_ticks,
     }
 }
 
@@ -212,4 +192,26 @@ pub fn ticks_of_register(receipt_size: u64, obj_size: u64, bloom_size: u64) -> u
     receipt_ticks
         .saturating_add(obj_ticks)
         .saturating_add(bloom_ticks)
+}
+
+pub fn ticks_of_blueprint_chunk(chunk_size: u64) -> u64 {
+    let reading_ticks =
+        constants::TICKS_FOR_INBOX_READ_PER_BYTE.saturating_mul(chunk_size);
+    let storing_ticks =
+        constants::TICKS_PER_BYTE_FOR_CHUNK_STORE.saturating_mul(chunk_size);
+    constants::TICKS_FOR_BLUEPRINT_CHUNK_SIGNATURE
+        .saturating_add(reading_ticks)
+        .saturating_add(storing_ticks)
+}
+
+pub fn ticks_of_delayed_input(input_size: u64) -> u64 {
+    let reading_ticks =
+        constants::TICKS_FOR_INBOX_READ_PER_BYTE.saturating_mul(input_size);
+    let storing_ticks =
+        constants::TICKS_PER_BYTE_FOR_CHUNK_STORE.saturating_mul(input_size);
+    reading_ticks.saturating_add(storing_ticks)
+}
+
+pub fn maximum_ticks_for_sequencer_chunk() -> u64 {
+    ticks_of_blueprint_chunk(4096)
 }

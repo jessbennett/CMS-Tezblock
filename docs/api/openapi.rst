@@ -51,24 +51,9 @@ Shell RPCs
 The node provides some RPCs which are independent of the protocol.
 Their OpenAPI specification can be found at:
 
-- `rpc-openapi.json (version 18.1) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/rpc-openapi.json>`_
-
-- `rpc-openapi-rc.json (version 19.0~rc1) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/rpc-openapi-rc.json>`_
+- `rpc-openapi.json (version 19.1) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/rpc-openapi.json>`_
 
 .. TODO tezos/tezos#2170: add/remove section(s)
-
-Nairobi RPCs
-------------
-
-The OpenAPI specifications for RPCs which are specific to the Nairobi (``PtNairob``)
-protocol can be found at:
-
-- `nairobi-openapi.json (version 19.0) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/nairobi-openapi.json>`_
-
-The OpenAPI specifications for RPCs which are related to the mempool
-and specific to the Nairobi protocol can be found at:
-
-- `nairobi-mempool-openapi.json (version 19.0) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/nairobi-mempool-openapi.json>`_
 
 Oxford RPCs
 -----------
@@ -76,40 +61,31 @@ Oxford RPCs
 The OpenAPI specifications for RPCs which are specific to the Oxford (``Proxford``)
 protocol can be found at:
 
-- `oxford-openapi.json (version 19.0) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/oxford-openapi.json>`_
+- `oxford-openapi.json (version 19.1) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/oxford-openapi.json>`_
 
 The OpenAPI specifications for RPCs which are related to the mempool
 and specific to the Oxford protocol can be found at:
 
-- `oxford-mempool-openapi.json (version 19.0) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/oxford-mempool-openapi.json>`_
+- `oxford-mempool-openapi.json (version 19.1) <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/oxford-mempool-openapi.json>`_
 
 Smart Rollup Node
 ~~~~~~~~~~~~~~~~~
 
 The smart rollup node exposes different RPCs depending on the underlying L1
 protocol in use. Their specification is given in the sections below.
+(The exact versions of the rollup node for which these files are produced can be
+seen in the field ``.info.version`` within each file.)
 
-Nairobi RPCs
-------------
-
-The OpenAPI specifications for the RPCs of the smart rollup node for the Nairobi
-(``PtNairob``) protocol can be found at:
-
-- `nairobi-smart-rollup-node-openapi.json (version from master branch)
-  <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/nairobi-smart-rollup-node-openapi.json>`_
-  (The exact version of the rollup node for which this file is produced can be
-  seen in the field ``.info.version`` of the file.)
+.. TODO tezos/tezos#2170: add/remove section(s)
 
 Oxford RPCs
 -----------
 
-The OpenAPI specifications for the RPCs of the smart rollup node for the Nairobi
+The OpenAPI specifications for the RPCs of the smart rollup node for the Oxford
 (``Proxford``) protocol can be found at:
 
-- `oxford-smart-rollup-node-openapi.json (version from master branch)
+- `oxford-smart-rollup-node-openapi.json (version 19.1)
   <https://gitlab.com/tezos/tezos/-/blob/master/docs/api/oxford-smart-rollup-node-openapi.json>`_
-  (The exact version of the rollup node for which this file is produced can be
-  seen in the field ``.info.version`` of the file.)
 
 .. _openapi_generate:
 

@@ -22,7 +22,7 @@ RUN apt-get update && \
     ca-certificates curl file \
     build-essential \
     git \
-    autoconf automake autotools-dev libtool xutils-dev clang \
+    autoconf automake autotools-dev libtool xutils-dev clang cmake \
     sccache && \
     rm -rf /var/lib/apt/lists/*
 
@@ -61,9 +61,15 @@ RUN curl -L "https://github.com/hermit-os/rust-std-hermit/releases/download/1.73
     && rust-std-1.73.0-riscv64gc-unknown-hermit/install.sh \
     && rm -r rust-std-1.73.0-riscv64gc-unknown-hermit rust-std-1.73.0-riscv64gc-unknown-hermit.tar.gz
 
+# Install Taplo
+RUN cargo +stable install taplo-cli --version 0.8.1 && \
+    taplo --version
+
 # install wabt: https://packages.debian.org/source/sid/wabt
+# Install a version of binutils which supports RISC-V and put symlink in PATH
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y wabt \
+    && apt-get install --no-install-recommends -y wabt binutils-riscv64-unknown-elf \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+RUN ln -s /usr/bin/riscv64-unknown-elf-objdump /usr/local/bin/objdump

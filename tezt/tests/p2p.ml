@@ -353,14 +353,14 @@ module Maintenance = struct
        A better way to reduce memory consumption would be to use nodes that
        only have the p2p layer. *)
     let* target_node =
-      Node.init ~rpc_local:true [Connections expected_connections]
+      Node.init ~rpc_external:false [Connections expected_connections]
     in
     let* target_client = Client.init ~endpoint:(Node target_node) () in
     Log.info "Target created." ;
     let nodes =
       Cluster.create
         max_connections
-        ~rpc_local:true
+        ~rpc_external:false
         [Connections (max_connections - 1)]
     in
     Cluster.clique nodes ;
@@ -816,7 +816,7 @@ module Connect_handler = struct
       ~uses_client:false
       ~uses_admin_client:false
     @@ fun () ->
-    let addr_of_port port = "127.0.0.1:" ^ string_of_int port in
+    let addr_of_port port = sf "%s:%d" Constant.default_host port in
     let create_node ?chain_name ?peer_port port =
       let peer_arg =
         Option.map (fun p -> Node.Peer (addr_of_port p)) peer_port

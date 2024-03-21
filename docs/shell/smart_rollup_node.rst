@@ -17,6 +17,8 @@ We first cover the operation of the rollup node and the corresponding workflow,
 using some predefined rollup logic (called kernel), and then we explain how the
 logic of a rollup can be defined by developing a custom rollup kernel.
 
+.. _smart_rollup_node_prerequisites:
+
 Prerequisites
 -------------
 
@@ -31,8 +33,36 @@ docker images or can be compiled from sources. Please refer to the
 `Dailynet <https://teztnets.com/dailynet-about>`_ website
 for installation details.
 
-An Octez rollup node needs an Octez node to run. We assume that
-an Octez node has been launched locally, typically by issuing:
+An Octez rollup node needs an Octez node to run. It is recommended that the two
+nodes run on the same machine. If this is the case, there is no additional
+configuration required of the Octez node. If they are on different network
+interfaces, the Octez node needs to allow the rollup node to make specific
+RPCs. To achieve this, one can add the following to the :doc:`Octez node
+configuration file <../user/node-configuration>`, where ``<ip.address:port>`` is
+the address at which the rollup node can contact the Octez node.
+
+.. code:: json
+
+   {
+      "rpc": {
+        "acl": [
+          {
+            "address": "<ip.address:port>",
+            "blacklist": []
+          }
+        ]
+      }
+   }
+
+.. warning::
+
+   Configuring a public facing Octez node this way exposes it to DoS
+   attacks. However one can allow all RPCs on the Octez node to be accessed
+   locally while still keeping sane defaults for outside accesses by specifying
+   an additional RPC server with, *e.g.*, ``--rpc-addr 127.0.0.1 --rpc-addr
+   0.0.0.0``.
+
+We assume that an Octez node has been launched locally, typically by issuing:
 
 .. code:: sh
 
@@ -576,6 +606,19 @@ ensure that the snapshot is not corrupted and can be imported by other users.
    It is also possible to use the ``--no-check`` option to disable the integrity
    checks during the export (i.e., phase 3), which will speed up the process.
 
+.. note::
+
+   Snapshots produced with the ``--compact`` option will be significantly
+   smaller (by a factor of 3) than otherwise as they contain a single commit of
+   the context for the first available block (instead of the full context
+   history). They take a comparable amount of time to be exported but take
+   longer to be imported because the context needs to be reconstructed.
+
+.. warning::
+
+   Snapshots exported with ``--compact`` for *archive* rollup nodes will need a
+   significant time to import because the context will need to be reconstructed
+   from the rollup genesis.
 
 Workflows
 ---------

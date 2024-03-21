@@ -94,3 +94,41 @@ job_foo:
 ```
 
 Unless necessary, use the simple form.
+
+This also applies to fields that can take either a value of a certain
+type, or an array of such values. If only a single value should be
+given, prefer the non-array form. Examples include the `cache:` field.
+
+Do:
+
+```
+job_foo:
+  script:
+    - echo "I'm cached!"
+  cache:
+    paths:
+      - foo.txt
+```
+
+Don't:
+
+```
+job_foo:
+  script:
+    - echo "I'm cached!"
+  cache:
+    - paths:
+        - foo.txt
+```
+
+# Time intervals
+
+Time intervals appear in e.g. `artifacts:expire_in`, `job:start_in`
+and `job:timeout` fields. Use full units: `seconds`, `minutes`,
+`hours`, `days`, etc. Do not use short versions, e.g. `min`.
+
+Do:
+ - 1 minute
+
+Do not:
+ - 20 min

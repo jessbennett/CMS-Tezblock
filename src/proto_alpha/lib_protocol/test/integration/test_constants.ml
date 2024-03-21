@@ -32,7 +32,7 @@
     Subject:    the consistency of parametric constants
  *)
 
-open Test_tez
+open Tez_helpers
 
 let test_sc_rollup_constants_consistency () =
   let open Protocol.Alpha_context in
@@ -47,6 +47,8 @@ let test_sc_rollup_constants_consistency () =
   let block_time = 10 in
   let sc_rollup =
     Default_parameters.Internal_for_tests.make_sc_rollup_parameter
+      ~dal_attested_slots_validity_lag:241_920
+        (* 4 weeks with a 10 secs block time. *)
       ~dal_activation_level:Raw_level.root
       block_time
   in
@@ -233,7 +235,9 @@ let liquidity_baking_subsidy_param () =
   let*? total_rewards = baking_rewards +? validators_rewards in
   let expected_subsidy = total_rewards /! 16L in
   let*?@ liquidity_baking_subsidy =
-    get_reward ~reward_kind:Liquidity_baking_subsidy
+    Protocol.Alpha_context.Delegate.Rewards.For_RPC
+    .liquidity_baking_subsidy_from_constants
+      constants
   in
   let*? diff = liquidity_baking_subsidy -? expected_subsidy in
   let max_diff = 1000 (* mutez *) in

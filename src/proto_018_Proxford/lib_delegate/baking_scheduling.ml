@@ -31,6 +31,7 @@ type loop_state = {
   heads_stream : Baking_state.proposal Lwt_stream.t;
   get_valid_blocks_stream : Baking_state.proposal Lwt_stream.t Lwt.t;
   qc_stream : Operation_worker.event Lwt_stream.t;
+  forge_event_stream : forge_event Lwt_stream.t;
   future_block_stream :
     [`New_future_head of proposal | `New_future_valid_proposal of proposal]
     Lwt_stream.t;
@@ -47,6 +48,8 @@ type loop_state = {
     option;
   mutable last_get_qc_event :
     [`QC_reached of Operation_worker.event option] Lwt.t option;
+  mutable last_forge_event :
+    [`New_forge_event of forge_event option] Lwt.t option;
 }
 
 type events =
@@ -55,11 +58,13 @@ type events =
   | `New_valid_proposal of proposal option
   | `New_head_proposal of proposal option
   | `QC_reached of Operation_worker.event option
+  | `New_forge_event of forge_event option
   | `Termination
   | `Timeout of timeout_kind ]
   Lwt.t
 
-let create_loop_state ?get_valid_blocks_stream ~heads_stream operation_worker =
+let create_loop_state ?get_valid_blocks_stream ~heads_stream ~forge_event_stream
+    operation_worker =
   let future_block_stream, push_future_block = Lwt_stream.create () in
   let get_valid_blocks_stream =
     match get_valid_blocks_stream with
@@ -70,12 +75,14 @@ let create_loop_state ?get_valid_blocks_stream ~heads_stream operation_worker =
     heads_stream;
     get_valid_blocks_stream;
     qc_stream = Operation_worker.get_quorum_event_stream operation_worker;
+    forge_event_stream;
     future_block_stream;
     push_future_block = (fun x -> push_future_block (Some x));
     last_get_head_event = None;
     last_get_valid_block_event = None;
     last_future_block_event = None;
     last_get_qc_event = None;
+    last_forge_event = None;
   }
 
 let find_in_known_round_intervals known_round_intervals ~predecessor_timestamp
@@ -190,6 +197,17 @@ let rec wait_next_event ~timeout loop_state =
         t
     | Some t -> t
   in
+  let get_forge_event () =
+    match loop_state.last_forge_event with
+    | None ->
+        let t =
+          let*! e = Lwt_stream.get loop_state.forge_event_stream in
+          Lwt.return (`New_forge_event e)
+        in
+        loop_state.last_forge_event <- Some t ;
+        t
+    | Some t -> t
+  in
   (* event construction *)
   let open Baking_state in
   let*! result =
@@ -200,6 +218,7 @@ let rec wait_next_event ~timeout loop_state =
         (get_valid_block_event () :> events);
         (get_future_block_event () :> events);
         (get_qc_event () :> events);
+        (get_forge_event () :> events);
         (timeout :> events);
       ]
   in
@@ -219,6 +238,10 @@ let rec wait_next_event ~timeout loop_state =
   | `QC_reached None ->
       (* Not supposed to happen: exit the loop *)
       loop_state.last_get_qc_event <- None ;
+      return_none
+  | `New_forge_event None ->
+      (* Not supposed to happen: exit the loop *)
+      loop_state.last_forge_event <- None ;
       return_none
   | `New_valid_proposal (Some proposal) -> (
       loop_state.last_get_valid_block_event <- None ;
@@ -271,6 +294,9 @@ let rec wait_next_event ~timeout loop_state =
       (Some (Operation_worker.Quorum_reached (candidate, attestation_qc))) ->
       loop_state.last_get_qc_event <- None ;
       return_some (Quorum_reached (candidate, attestation_qc))
+  | `New_forge_event (Some event) ->
+      loop_state.last_forge_event <- None ;
+      return_some (New_forge_event event)
   | `Timeout e -> return_some (Timeout e)
 
 (** From the current [state], the function returns an optional
@@ -544,14 +570,16 @@ let compute_next_timeout state : Baking_state.timeout_kind Lwt.t tzresult Lwt.t
     | None ->
         let*! () = Events.(emit no_need_to_wait_for_proposal ()) in
         return
-          (Lwt.return (Time_to_bake_next_level {at_round = next_baking_round}))
+          (Lwt.return
+             (Time_to_prepare_next_level_block {at_round = next_baking_round}))
     | Some t ->
         let*! () =
           Events.(emit waiting_time_to_bake (delay, next_baking_time))
         in
         return
           (let*! () = t in
-           Lwt.return (Time_to_bake_next_level {at_round = next_baking_round}))
+           Lwt.return
+             (Time_to_prepare_next_level_block {at_round = next_baking_round}))
   in
   let delay_next_round_timeout next_round =
     (* we only delay if it's our turn to bake *)
@@ -570,9 +598,8 @@ let compute_next_timeout state : Baking_state.timeout_kind Lwt.t tzresult Lwt.t
   let should_wait_to_forge_block (_next_baking_time, next_baking_round) =
     Option.is_some state.level_state.elected_block
     && Round.equal next_baking_round Round.zero
-    && Option.is_none state.level_state.next_forged_block
   in
-  let waiting_to_forge_block (next_baking_time, _next_baking_round) =
+  let waiting_to_forge_block (next_baking_time, next_baking_round) =
     let*! () = Events.(emit first_baker_of_next_level ()) in
     let now = Time.System.now () in
     let next_baking_ptime = Time.System.of_protocol_exn next_baking_time in
@@ -591,7 +618,9 @@ let compute_next_timeout state : Baking_state.timeout_kind Lwt.t tzresult Lwt.t
     match sleep_until_ptime next_forging_ptime with
     | None ->
         let*! () = Events.(emit no_need_to_wait_to_forge_block ()) in
-        return (Lwt.return Time_to_forge_block)
+        return
+          (Lwt.return
+             (Time_to_prepare_next_level_block {at_round = next_baking_round}))
     | Some t ->
         let*! () =
           Events.(
@@ -601,7 +630,8 @@ let compute_next_timeout state : Baking_state.timeout_kind Lwt.t tzresult Lwt.t
         in
         return
           (let*! () = t in
-           Lwt.return Time_to_forge_block)
+           Lwt.return
+             (Time_to_prepare_next_level_block {at_round = next_baking_round}))
   in
   (* TODO: re-use what has been done in round_synchronizer.ml *)
   (* Compute the timestamp of the next possible round. *)
@@ -732,6 +762,12 @@ let create_initial_state cctxt ?(synchronize = true) ~chain config
       constants;
       round_durations;
       operation_worker;
+      forge_worker_hooks =
+        {
+          push_request = (fun _ -> assert false);
+          get_forge_event_stream = (fun _ -> assert false);
+          cancel_all_pending_tasks = (fun _ -> assert false);
+        };
       validation_mode;
       delegates;
       cache;
@@ -741,6 +777,17 @@ let create_initial_state cctxt ?(synchronize = true) ~chain config
         Option.map create_dal_node_rpc_ctxt config.dal_node_endpoint;
     }
   in
+  (* Trick to provide the global state to the forge worker without
+     introducing a circular dependency. *)
+  let forge_worker = Forge_worker.start global_state in
+  global_state.forge_worker_hooks <-
+    {
+      push_request = Forge_worker.push_request forge_worker;
+      get_forge_event_stream =
+        (fun () -> Forge_worker.get_event_stream forge_worker);
+      cancel_all_pending_tasks =
+        (fun () -> Forge_worker.cancel_all_pending_tasks forge_worker);
+    } ;
   let chain = `Hash chain_id in
   let current_level = current_proposal.block.shell.level in
   let* delegate_slots =
@@ -776,7 +823,6 @@ let create_initial_state cctxt ?(synchronize = true) ~chain config
       delegate_slots;
       next_level_delegate_slots;
       next_level_proposed_round = None;
-      next_forged_block = None;
     }
   in
   let* round_state =
@@ -785,13 +831,22 @@ let create_initial_state cctxt ?(synchronize = true) ~chain config
       let*? current_round =
         Baking_actions.compute_round current_proposal round_durations
       in
-      return {current_round; current_phase = Idle; delayed_quorum = None}
+      return
+        {
+          current_round;
+          current_phase = Idle;
+          delayed_quorum = None;
+          early_attestations = [];
+          awaiting_unlocking_pqc = false;
+        }
     else
       return
         {
           Baking_state.current_round = Round.zero;
           current_phase = Idle;
           delayed_quorum = None;
+          early_attestations = [];
+          awaiting_unlocking_pqc = false;
         }
   in
   let state = {global_state; level_state; round_state} in
@@ -829,10 +884,12 @@ let rec automaton_loop ?(stop_on_event = fun _ -> false) ~config ~on_error
   in
   let*! state', action = State_transitions.step state event in
   let* state'' =
-    let*! state_opt =
-      Baking_actions.perform_action ~state_recorder state' action
+    let*! state_res =
+      let* state'' = Baking_actions.perform_action state' action in
+      let* () = may_record_new_state ~previous_state:state ~new_state:state'' in
+      return state''
     in
-    match state_opt with
+    match state_res with
     | Ok state'' -> return state''
     | Error error ->
         let* () = on_error error in
@@ -999,9 +1056,13 @@ let run cctxt ?canceler ?(stop_on_event = fun _ -> false)
     | Error _ -> Stdlib.failwith "Failed to get the validated blocks stream"
     | Ok (vbs, _) -> Lwt.return vbs
   in
+  let forge_event_stream =
+    initial_state.global_state.forge_worker_hooks.get_forge_event_stream ()
+  in
   let loop_state =
     create_loop_state
       ~get_valid_blocks_stream
+      ~forge_event_stream
       ~heads_stream
       initial_state.global_state.operation_worker
   in

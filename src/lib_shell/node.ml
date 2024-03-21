@@ -2,7 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
-(* Copyright (c) 2018-2021 Nomadic Labs, <contact@nomadic-labs.com>          *)
+(* Copyright (c) 2018-2024 Nomadic Labs, <contact@nomadic-labs.com>          *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -80,11 +80,11 @@ let get_version node =
        commit_hash = Tezos_version_value.Current_git_info.commit_hash;
        commit_date = Tezos_version_value.Current_git_info.committer_date;
      }
-      : Tezos_version.Node_version.commit_info)
+      : Tezos_version.Octez_node_version.commit_info)
   in
-  let version = Tezos_version_value.Current_git_info.version in
+  let version = Tezos_version_value.Current_git_info.octez_version in
   let network_version = P2p.announced_version node.p2p in
-  Tezos_version.Node_version.
+  Tezos_version.Octez_node_version.
     {version; commit_info = Some commit_info; network_version}
 
 let peer_metadata_cfg : _ P2p_params.peer_meta_config =
@@ -392,6 +392,7 @@ let build_rpc_directory ~node_version ~commit_info node =
        ~mainchain_validator:node.mainchain_validator
        node.store) ;
   merge (Version_directory.rpc_directory node_version) ;
+  merge (Health_directory.build_rpc_directory ()) ;
   register0 Tezos_rpc.Service.error_service (fun () () ->
       Lwt.return_ok (Data_encoding.Json.schema Error_monad.error_encoding)) ;
   !dir

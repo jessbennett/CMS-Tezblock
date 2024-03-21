@@ -25,13 +25,13 @@
 (*****************************************************************************)
 
 (* Declaration order must respect the version order. *)
-type t = Nairobi | Oxford | Alpha
+type t = Paris | Oxford | Alpha
 
-let all = [Nairobi; Oxford; Alpha]
+let all = [Paris; Oxford; Alpha]
 
 let encoding =
   Data_encoding.string_enum
-    [("nairobi", Nairobi); ("oxford", Oxford); ("alpha", Alpha)]
+    [("paris", Paris); ("oxford", Oxford); ("alpha", Alpha)]
 
 type constants =
   | Constants_sandbox
@@ -45,17 +45,14 @@ let constants_to_string = function
   | Constants_mainnet_with_chain_id -> "mainnet-with-chain-id"
   | Constants_test -> "test"
 
-let name = function
-  | Alpha -> "Alpha"
-  | Oxford -> "Oxford"
-  | Nairobi -> "Nairobi"
+let name = function Alpha -> "Alpha" | Oxford -> "Oxford" | Paris -> "Paris"
 
-let number = function Nairobi -> 017 | Oxford -> 018 | Alpha -> 019
+let number = function Oxford -> 018 | Paris -> 019 | Alpha -> 020
 
 let directory = function
   | Alpha -> "proto_alpha"
   | Oxford -> "proto_018_Proxford"
-  | Nairobi -> "proto_017_PtNairob"
+  | Paris -> "proto_019_PtParisA"
 
 (* Test tags must be lowercase. *)
 let tag protocol = String.lowercase_ascii (name protocol)
@@ -63,7 +60,7 @@ let tag protocol = String.lowercase_ascii (name protocol)
 let hash = function
   | Alpha -> "ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK"
   | Oxford -> "ProxfordYmVfjWnRcgjWH36fW6PArwqykTFzotUxRs6gmTcZDuH"
-  | Nairobi -> "PtNairobiyssHuh87hEhfVBGCVrK3WnS8Z2FT4ymB5tAa4r1nQf"
+  | Paris -> "PtParisAeco71sYvYgfnVPb4rRJe6zgzYRDS5U8t5ednSRPUFN5"
 
 let genesis_hash = "ProtoGenesisGenesisGenesisGenesisGenesisGenesk612im"
 
@@ -274,8 +271,8 @@ let write_parameter_file :
 
 let previous_protocol = function
   | Alpha -> Some Oxford
-  | Oxford -> Some Nairobi
-  | Nairobi -> None
+  | Oxford -> None
+  | Paris -> Some Oxford
 
 let has_predecessor p = previous_protocol p <> None
 

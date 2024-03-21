@@ -8,9 +8,10 @@ Where <action> can be:
 
 * --update-ocamlformat: update all the \`.ocamlformat\` files and
   git-commit (requires clean repo).
+* --format-scripts: format shell scripts inplace using shfmt
 * --check-ocamlformat: check the above does nothing.
 * --check-gitlab-ci-yml: check .gitlab-ci.yml has been updated.
-* --check-scripts: check the .sh files
+* --check-scripts: shellcheck and check formatting of the .sh files
 * --check-redirects: check docs/_build/_redirects.
 * --check-coq-attributes: check the presence of coq attributes.
 * --check-rust-toolchain: check the contents of rust-toolchain files
@@ -33,10 +34,39 @@ say() {
 
 declare -a source_directories
 
-source_directories=(src docs/doc_gen tezt devtools contrib etherlink)
+# Make sure that the set of source_directories here are also reflected in
+# [changeset_lint_files] in [ci/bin/common.ml].
+source_directories=(src docs/doc_gen tezt devtools contrib etherlink client-libs)
 # Set of newline-separated basic regular expressions to exclude from --check-licenses-git-new.
 license_check_exclude=$(
-  cat << 'EOF'
+  cat << EOF
+src/proto_019_PtParisA/lib_benchmark/test/test_distribution.ml
+src/proto_019_PtParisA/lib_client_sapling/client_sapling_commands.mli
+src/proto_019_PtParisA/lib_client_sapling/context.mli
+src/proto_019_PtParisA/lib_client_sapling/wallet.mli
+src/proto_019_PtParisA/lib_delegate/test/mockup_simulator/faked_daemon.ml
+src/proto_019_PtParisA/lib_delegate/test/mockup_simulator/faked_services.ml
+src/proto_019_PtParisA/lib_delegate/test/test_scenario.ml
+src/proto_019_PtParisA/lib_protocol/lazy_storage_diff.mli
+src/proto_019_PtParisA/lib_protocol/liquidity_baking_cpmm.ml
+src/proto_019_PtParisA/lib_protocol/liquidity_baking_lqt.ml
+src/proto_019_PtParisA/lib_protocol/sc_rollup_inbox_merkelized_payload_hashes_repr.ml
+src/proto_019_PtParisA/lib_protocol/sc_rollup_inbox_merkelized_payload_hashes_repr.mli
+src/proto_019_PtParisA/lib_protocol/test/helpers/nonce.ml
+src/proto_019_PtParisA/lib_protocol/test/helpers/script_big_map.ml
+src/proto_019_PtParisA/lib_protocol/test/helpers/script_big_map.mli
+src/proto_019_PtParisA/lib_protocol/test/helpers/ticket_helpers.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/test_frozen_bonds.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/generators.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/manager_operation_helpers.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/test_1m_restriction.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/test_covalidity.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/test_manager_operation_validation.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/test_sanity.ml
+src/proto_019_PtParisA/lib_protocol/test/integration/validate/test_validation_batch.ml
+src/proto_019_PtParisA/lib_protocol/test/unit/test_time_repr.ml
+src/proto_019_PtParisA/lib_protocol/test/unit/test_zk_rollup_storage.ml
+.*_generated.ml
 EOF
 )
 
@@ -77,8 +107,19 @@ function shellcheck_script() {
 }
 
 function shfmt_script() {
-  # following google style guide for sh formatting
   shfmt -i 2 -sr -d "$1"
+}
+
+function shfmt_script_write() {
+  shfmt -w -i 2 -sr -d "$1"
+}
+
+format_scripts() {
+  scripts=$(find "${source_directories[@]}" scripts docs -name "*.sh" -type f -print)
+
+  for script in ${scripts}; do
+    shfmt_script_write "$script"
+  done
 }
 
 check_scripts() {
@@ -223,7 +264,10 @@ check_licenses_git_new() {
     "${CHECK_LICENSES_DIFF_BASE:-}" HEAD -- "${source_directories[@]}" > "$diff"
   if [ -n "$license_check_exclude" ]; then
     diff2=$(mktemp)
-    grep -v "$license_check_exclude" "$diff" > "$diff2"
+    # 'grep -v' will exit with a non-zero exit code when no lines are selected.
+    # consequently, if $diff \ $license_check_exclude is empty, the
+    # grep will fail, which we want to allow.
+    grep -v "$license_check_exclude" "$diff" > "$diff2" || true
     mv "$diff2" "$diff"
   fi
 
@@ -269,6 +313,9 @@ case "$action" in
   ;;
 "--check-scripts")
   action=check_scripts
+  ;;
+"--format-scripts")
+  action=format_scripts
   ;;
 "--check-redirects")
   action=check_redirects

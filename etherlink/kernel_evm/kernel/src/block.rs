@@ -5,11 +5,15 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::apply::{apply_transaction, ExecutionInfo};
-use crate::blueprint_storage::{drop_head_blueprint, read_next_blueprint};
+use crate::apply::{
+    apply_transaction, ExecutionInfo, ExecutionResult, WITHDRAWAL_OUTBOX_QUEUE,
+};
+use crate::blueprint_storage::{drop_blueprint, read_next_blueprint};
 use crate::error::Error;
+use crate::event::Event;
 use crate::indexable_storage::IndexableStorage;
-use crate::safe_storage::KernelRuntime;
+use crate::internal_storage::InternalRuntime;
+use crate::safe_storage::{KernelRuntime, SafeStorage};
 use crate::storage;
 use crate::storage::init_account_index;
 use crate::upgrade::KernelUpgrade;
@@ -22,7 +26,11 @@ use evm_execution::account_storage::{init_account_storage, EthereumAccountStorag
 use evm_execution::precompiles;
 use evm_execution::precompiles::PrecompileBTreeMap;
 use primitive_types::{H256, U256};
+use tezos_crypto_rs::hash::ContractKt1Hash;
+use tezos_ethereum::block::BlockFees;
 use tezos_evm_logging::{log, Level::*};
+use tezos_smart_rollup::outbox::OutboxQueue;
+use tezos_smart_rollup_host::path::Path;
 use tezos_smart_rollup_host::runtime::Runtime;
 use tick_model::estimate_remaining_ticks_for_transaction_execution;
 
@@ -50,13 +58,17 @@ pub enum ComputationResult {
     Finished,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute<Host: Runtime>(
     host: &mut Host,
+    outbox_queue: &OutboxQueue<'_, impl Path>,
     block_in_progress: &mut BlockInProgress,
     block_constants: &BlockConstants,
     precompiles: &PrecompileBTreeMap<Host>,
     evm_account_storage: &mut EthereumAccountStorage,
     accounts_index: &mut IndexableStorage,
+    is_first_block_of_reboot: bool,
+    ticketer: &Option<ContractKt1Hash>,
 ) -> Result<ComputationResult, anyhow::Error> {
     log!(
         host,
@@ -64,26 +76,24 @@ fn compute<Host: Runtime>(
         "Queue length {}.",
         block_in_progress.queue_length()
     );
+    let mut is_first_transaction = true;
     // iteration over all remaining transaction in the block
     while block_in_progress.has_tx() {
-        // is reboot necessary ?
-        if block_in_progress.would_overflow() {
-            // TODO: https://gitlab.com/tezos/tezos/-/issues/6094
-            // there should be an upper bound on gasLimit
-            return Ok(ComputationResult::RebootNeeded);
-        }
         let transaction = block_in_progress.pop_tx().ok_or(Error::Reboot)?;
         let data_size: u64 = transaction.data_size();
 
         // The current number of ticks remaining for the current `kernel_run` is allocated for the transaction.
         let allocated_ticks = estimate_remaining_ticks_for_transaction_execution(
-            block_in_progress.estimated_ticks,
+            block_in_progress.estimated_ticks_in_run,
             data_size,
         );
+
+        let retriable = !is_first_transaction || !is_first_block_of_reboot;
         // If `apply_transaction` returns `None`, the transaction should be
         // ignored, i.e. invalid signature or nonce.
         match apply_transaction(
             host,
+            outbox_queue,
             block_constants,
             precompiles,
             &transaction,
@@ -91,8 +101,10 @@ fn compute<Host: Runtime>(
             evm_account_storage,
             accounts_index,
             allocated_ticks,
+            retriable,
+            ticketer,
         )? {
-            Some(ExecutionInfo {
+            ExecutionResult::Valid(ExecutionInfo {
                 receipt_info,
                 object_info,
                 estimated_ticks_used,
@@ -106,21 +118,36 @@ fn compute<Host: Runtime>(
                 )?;
                 log!(
                     host,
-                    Debug,
+                    Benchmarking,
                     "Estimated ticks after tx: {}",
-                    block_in_progress.estimated_ticks
+                    block_in_progress.estimated_ticks_in_run
                 );
             }
-            None => {
-                block_in_progress.account_for_invalid_transaction(data_size);
+
+            ExecutionResult::Retriable(_) => {
+                // It is the first block processed in this reboot. Additionally,
+                // it is the first transaction processed from this block in this
+                // reboot. The tick limit cannot be larger.
                 log!(
                     host,
                     Debug,
+                    "The transaction exhausted the ticks of the \
+                         current reboot but will be retried."
+                );
+                block_in_progress.repush_tx(transaction);
+                return Ok(ComputationResult::RebootNeeded);
+            }
+            ExecutionResult::Invalid => {
+                block_in_progress.account_for_invalid_transaction(data_size);
+                log!(
+                    host,
+                    Benchmarking,
                     "Estimated ticks after tx: {}",
-                    block_in_progress.estimated_ticks
+                    block_in_progress.estimated_ticks_in_run
                 );
             }
         };
+        is_first_transaction = false;
     }
     Ok(ComputationResult::Finished)
 }
@@ -129,7 +156,7 @@ fn next_bip_from_blueprints<Host: Runtime>(
     host: &mut Host,
     current_block_number: U256,
     current_block_parent_hash: H256,
-    current_constants: &BlockConstants,
+    current_constants: &mut BlockConstants,
     tick_counter: &TickCounter,
     config: &mut Configuration,
     kernel_upgrade: &Option<KernelUpgrade>,
@@ -144,12 +171,25 @@ fn next_bip_from_blueprints<Host: Runtime>(
                     return Ok(None);
                 }
             }
+            let gas_price = crate::gas_price::base_fee_per_gas(host, blueprint.timestamp);
+            crate::gas_price::store_new_base_fee_per_gas(
+                host,
+                gas_price,
+                &mut current_constants.block_fees,
+            )?;
+
             let bip = block_in_progress::BlockInProgress::from_blueprint(
                 blueprint,
                 current_block_number,
                 current_block_parent_hash,
                 current_constants,
                 tick_counter.c,
+            );
+
+            tezos_evm_logging::log!(
+                host,
+                tezos_evm_logging::Level::Debug,
+                "bip: {bip:?}"
             );
             Ok(Some(bip))
         }
@@ -160,6 +200,7 @@ fn next_bip_from_blueprints<Host: Runtime>(
 #[allow(clippy::too_many_arguments)]
 fn compute_bip<Host: KernelRuntime>(
     host: &mut Host,
+    outbox_queue: &OutboxQueue<'_, impl Path>,
     mut block_in_progress: BlockInProgress,
     current_constants: &mut BlockConstants,
     current_block_number: &mut U256,
@@ -168,48 +209,102 @@ fn compute_bip<Host: KernelRuntime>(
     evm_account_storage: &mut EthereumAccountStorage,
     accounts_index: &mut IndexableStorage,
     tick_counter: &mut TickCounter,
+    first_block_of_reboot: &mut bool,
+    ticketer: &Option<ContractKt1Hash>,
 ) -> anyhow::Result<ComputationResult> {
     let result = compute(
         host,
+        outbox_queue,
         &mut block_in_progress,
         current_constants,
         precompiles,
         evm_account_storage,
         accounts_index,
+        *first_block_of_reboot,
+        ticketer,
     )?;
     match result {
         ComputationResult::RebootNeeded => {
+            log!(host, Info, "Ask for reboot.");
             log!(
                 host,
-                Info,
+                Benchmarking,
                 "Ask for reboot. Estimated ticks: {}",
-                &block_in_progress.estimated_ticks
+                &block_in_progress.estimated_ticks_in_run
             );
             storage::store_block_in_progress(host, &block_in_progress)?;
-            host.mark_for_reboot()?
         }
         ComputationResult::Finished => {
-            *tick_counter = TickCounter::finalize(block_in_progress.estimated_ticks);
+            crate::gas_price::register_block(host, &block_in_progress)?;
+            *tick_counter =
+                TickCounter::finalize(block_in_progress.estimated_ticks_in_run);
             let new_block = block_in_progress
                 .finalize_and_store(host)
                 .context("Failed to finalize the block in progress")?;
             *current_block_number = new_block.number + 1;
             *current_block_parent_hash = new_block.hash;
-            *current_constants = new_block.constants(
-                current_constants.chain_id,
-                current_constants.base_fee_per_gas,
-            );
-            // Drop the processed blueprint from the storage
-            drop_head_blueprint(host)?
+            *current_constants = new_block
+                .constants(current_constants.chain_id, current_constants.block_fees);
+
+            *first_block_of_reboot = false;
         }
     }
     Ok(result)
 }
 
-pub fn produce<Host: KernelRuntime>(
+fn revert_block<Host: Runtime>(
+    safe_host: &mut SafeStorage<&mut Host, &mut impl InternalRuntime>,
+    block_in_progress: bool,
+    number: U256,
+    error: anyhow::Error,
+) -> anyhow::Result<()> {
+    log!(
+        safe_host,
+        Error,
+        "Block{} {} failed with '{:?}'. Reverting.",
+        if block_in_progress { "InProgress" } else { "" },
+        number,
+        error
+    );
+    safe_host.revert()?;
+    drop_blueprint(safe_host.host, number)?;
+    Ok(())
+}
+
+fn promote_block<Host: Runtime>(
+    safe_host: &mut SafeStorage<&mut Host, &mut impl InternalRuntime>,
+    outbox_queue: &OutboxQueue<'_, impl Path>,
+    block_in_progress: bool,
+    number: U256,
+) -> anyhow::Result<()> {
+    if block_in_progress {
+        storage::delete_block_in_progress(safe_host)?;
+    }
+    safe_host.promote()?;
+    drop_blueprint(safe_host.host, number)?;
+
+    let number = storage::read_current_block_number(safe_host.host)?;
+    let hash = storage::read_current_block_hash(safe_host.host)?;
+
+    Event::BlueprintApplied { number, hash }.store(safe_host.host)?;
+
+    let written = outbox_queue.flush_queue(safe_host.host);
+    // Log to Info only if we flushed messages.
+    let level = if written > 0 { Info } else { Debug };
+    log!(
+        safe_host,
+        level,
+        "Flushed outbox queue messages ({} flushed)",
+        written
+    );
+
+    Ok(())
+}
+
+pub fn produce<Host: Runtime>(
     host: &mut Host,
     chain_id: U256,
-    base_fee_per_gas: U256,
+    block_fees: BlockFees,
     config: &mut Configuration,
 ) -> Result<ComputationResult, anyhow::Error> {
     let kernel_upgrade = upgrade::read_kernel_upgrade(host)?;
@@ -217,7 +312,7 @@ pub fn produce<Host: KernelRuntime>(
     let (mut current_constants, mut current_block_number, mut current_block_parent_hash) =
         match storage::read_current_block(host) {
             Ok(block) => (
-                block.constants(chain_id, base_fee_per_gas),
+                block.constants(chain_id, block_fees),
                 block.number + 1,
                 block.hash,
             ),
@@ -225,7 +320,7 @@ pub fn produce<Host: KernelRuntime>(
                 let timestamp = current_timestamp(host);
                 let timestamp = U256::from(timestamp.as_u64());
                 (
-                    BlockConstants::first_block(timestamp, chain_id, base_fee_per_gas),
+                    BlockConstants::first_block(timestamp, chain_id, block_fees),
                     U256::zero(),
                     H256::from_slice(&hex::decode("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap()),
                 )
@@ -234,42 +329,82 @@ pub fn produce<Host: KernelRuntime>(
     let mut evm_account_storage =
         init_account_storage().context("Failed to initialize EVM account storage")?;
     let mut accounts_index = init_account_index()?;
-    let precompiles = precompiles::precompile_set::<Host>();
     let mut tick_counter = TickCounter::new(0u64);
+    let mut first_block_of_reboot = true;
+
+    #[cfg(not(test))]
+    let mut internal_storage = crate::internal_storage::InternalStorage();
+    #[cfg(test)]
+    let mut internal_storage = crate::mock_internal::MockInternal();
+    let mut safe_host = SafeStorage {
+        host,
+        internal: &mut internal_storage,
+    };
+    let outbox_queue = OutboxQueue::new(&WITHDRAWAL_OUTBOX_QUEUE, u32::MAX)?;
+    let precompiles = precompiles::precompile_set::<SafeStorage<&mut Host, _>>();
 
     // Check if there's a BIP in storage to resume its execution
-    match storage::read_block_in_progress(host)? {
+    match storage::read_block_in_progress(&safe_host)? {
         None => (),
-        Some(block_in_progress) => match compute_bip(
-            host,
-            block_in_progress,
-            &mut current_constants,
-            &mut current_block_number,
-            &mut current_block_parent_hash,
-            &precompiles,
-            &mut evm_account_storage,
-            &mut accounts_index,
-            &mut tick_counter,
-        )? {
-            ComputationResult::Finished => storage::delete_block_in_progress(host)?,
-            ComputationResult::RebootNeeded => {
-                return Ok(ComputationResult::RebootNeeded)
+        Some(block_in_progress) => {
+            let processed_blueprint = block_in_progress.number;
+            match compute_bip(
+                &mut safe_host,
+                &outbox_queue,
+                block_in_progress,
+                &mut current_constants,
+                &mut current_block_number,
+                &mut current_block_parent_hash,
+                &precompiles,
+                &mut evm_account_storage,
+                &mut accounts_index,
+                &mut tick_counter,
+                &mut first_block_of_reboot,
+                &config.tezos_contracts.ticketer,
+            ) {
+                Ok(ComputationResult::Finished) => promote_block(
+                    &mut safe_host,
+                    &outbox_queue,
+                    true,
+                    processed_blueprint,
+                )?,
+                Ok(ComputationResult::RebootNeeded) => {
+                    // The computation still needs to reboot, we do nothing.
+                    return Ok(ComputationResult::RebootNeeded);
+                }
+                Err(err) => {
+                    revert_block(&mut safe_host, true, processed_blueprint, err)?;
+                    // The block was reverted because it failed. We don't know at
+                    // which point did it fail nor why. We cannot make assumption
+                    // on how many ticks it consumed before failing. Therefore
+                    // the safest solution is to simply reboot after a failure.
+                    return Ok(ComputationResult::RebootNeeded);
+                }
             }
-        },
+        }
     }
+
+    upgrade::possible_sequencer_upgrade(safe_host.host)?;
 
     // Execute stored blueprints
     while let Some(block_in_progress) = next_bip_from_blueprints(
-        host,
+        safe_host.host,
         current_block_number,
         current_block_parent_hash,
-        &current_constants,
+        &mut current_constants,
         &tick_counter,
         config,
         &kernel_upgrade,
     )? {
+        // We are going to execute a new block, we copy the storage to allow
+        // to revert if the block fails.
+        safe_host.start()?;
+
+        let processed_blueprint = current_block_number;
+
         match compute_bip(
-            host,
+            &mut safe_host,
+            &outbox_queue,
             block_in_progress,
             &mut current_constants,
             &mut current_block_number,
@@ -278,14 +413,33 @@ pub fn produce<Host: KernelRuntime>(
             &mut evm_account_storage,
             &mut accounts_index,
             &mut tick_counter,
-        )? {
-            ComputationResult::Finished => (),
-            ComputationResult::RebootNeeded => {
-                return Ok(ComputationResult::RebootNeeded)
+            &mut first_block_of_reboot,
+            &config.tezos_contracts.ticketer,
+        ) {
+            Ok(ComputationResult::Finished) => {
+                promote_block(&mut safe_host, &outbox_queue, false, processed_blueprint)?
+            }
+            Ok(ComputationResult::RebootNeeded) => {
+                // The computation will resume at next reboot, we leave the
+                // storage untouched.
+                return Ok(ComputationResult::RebootNeeded);
+            }
+            Err(err) => {
+                revert_block(&mut safe_host, false, processed_blueprint, err)?;
+                // The block was reverted because it failed. We don't know at
+                // which point did it fail nor why. We cannot make assumption
+                // on how many ticks it consumed before failing. Therefore
+                // the safest solution is to simply reboot after a failure.
+                return Ok(ComputationResult::RebootNeeded);
             }
         }
     }
-    log!(host, Debug, "Estimated ticks: {}", tick_counter.c);
+    log!(
+        safe_host,
+        Benchmarking,
+        "Estimated ticks: {}",
+        tick_counter.c
+    );
     Ok(ComputationResult::Finished)
 }
 
@@ -294,30 +448,27 @@ mod tests {
     use super::*;
     use crate::blueprint::Blueprint;
     use crate::blueprint_storage::store_inbox_blueprint;
+    use crate::blueprint_storage::store_inbox_blueprint_by_number;
     use crate::inbox::Transaction;
     use crate::inbox::TransactionContent;
     use crate::inbox::TransactionContent::Ethereum;
-    use crate::mock_internal::MockInternal;
-    use crate::safe_storage::SafeStorage;
+    use crate::inbox::TransactionContent::EthereumDelayed;
     use crate::storage::read_block_in_progress;
+    use crate::storage::read_current_block;
     use crate::storage::{init_blocks_index, init_transaction_hashes_index};
     use crate::storage::{read_transaction_receipt, read_transaction_receipt_status};
     use crate::tick_model;
-    use crate::{retrieve_base_fee_per_gas, retrieve_chain_id};
+    use crate::{retrieve_block_fees, retrieve_chain_id};
     use evm_execution::account_storage::{
         account_path, init_account_storage, EthereumAccountStorage,
     };
-    use primitive_types::{H160, H256, U256};
-    use std::ops::Rem;
+    use primitive_types::{H160, U256};
     use std::str::FromStr;
     use tezos_ethereum::transaction::{
         TransactionHash, TransactionStatus, TransactionType, TRANSACTION_HASH_SIZE,
     };
     use tezos_ethereum::tx_common::EthereumTransactionCommon;
-    use tezos_ethereum::tx_signature::TxSignature;
-    use tezos_smart_rollup_core::SmartRollupCore;
     use tezos_smart_rollup_encoding::timestamp::Timestamp;
-    use tezos_smart_rollup_host::path::RefPath;
     use tezos_smart_rollup_mock::MockHost;
 
     fn blueprint(transactions: Vec<Transaction>) -> Blueprint {
@@ -331,13 +482,8 @@ mod tests {
         let data = &hex::decode(s).unwrap();
         Some(H160::from_slice(data))
     }
-    fn string_to_h256_unsafe(s: &str) -> H256 {
-        let mut v: [u8; 32] = [0; 32];
-        hex::decode_to_slice(s, &mut v).expect("Could not parse to 256 hex value.");
-        H256::from(v)
-    }
 
-    fn set_balance<Host: KernelRuntime>(
+    fn set_balance<Host: Runtime>(
         host: &mut Host,
         evm_account_storage: &mut EthereumAccountStorage,
         address: &H160,
@@ -358,7 +504,7 @@ mod tests {
         }
     }
 
-    fn get_balance<Host: KernelRuntime>(
+    fn get_balance<Host: Runtime>(
         host: &mut Host,
         evm_account_storage: &mut EthereumAccountStorage,
         address: &H160,
@@ -371,21 +517,38 @@ mod tests {
 
     const DUMMY_CHAIN_ID: U256 = U256::one();
     const DUMMY_BASE_FEE_PER_GAS: u64 = 21000u64;
+    const DUMMY_DA_FEE: u64 = 2_000_000_000_000u64;
+
+    fn dummy_block_fees() -> BlockFees {
+        BlockFees::new(
+            U256::from(DUMMY_BASE_FEE_PER_GAS),
+            U256::from(DUMMY_BASE_FEE_PER_GAS),
+            U256::from(DUMMY_DA_FEE),
+        )
+    }
 
     fn dummy_eth_gen_transaction(
-        nonce: U256,
-        v: U256,
-        r: H256,
-        s: H256,
+        nonce: u64,
+        type_: TransactionType,
     ) -> EthereumTransactionCommon {
         let chain_id = Some(DUMMY_CHAIN_ID);
         let gas_price = U256::from(40000000u64);
         let gas_limit = 21000u64;
+
+        let gas_for_fees = crate::fees::gas_for_fees(
+            DUMMY_DA_FEE.into(),
+            DUMMY_BASE_FEE_PER_GAS.into(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let gas_limit = gas_limit + gas_for_fees;
+
         let to = address_from_str("423163e58aabec5daa3dd1130b759d24bef0f6ea");
         let value = U256::from(500000000u64);
         let data: Vec<u8> = vec![];
         EthereumTransactionCommon::new(
-            TransactionType::Legacy,
+            type_,
             chain_id,
             nonce,
             gas_price,
@@ -395,47 +558,49 @@ mod tests {
             value,
             data,
             vec![],
-            Some(TxSignature::new(v, r, s).unwrap()),
+            None,
         )
     }
 
+    // When updating the dummy txs, you can use the `resign` function to get the updated
+    // signatures (see bottom of test module)
     fn dummy_eth_caller() -> H160 {
         H160::from_str("f95abdf6ede4c3703e0e9453771fbee8592d31e9").unwrap()
+    }
+
+    fn sign_transaction(tx: EthereumTransactionCommon) -> EthereumTransactionCommon {
+        let private_key =
+            "e922354a3e5902b5ac474f3ff08a79cff43533826b8f451ae2190b65a9d26158";
+
+        tx.sign_transaction(private_key.to_string()).unwrap()
+    }
+
+    fn make_dummy_transaction(
+        nonce: u64,
+        type_: TransactionType,
+    ) -> EthereumTransactionCommon {
+        let tx = dummy_eth_gen_transaction(nonce, type_);
+        sign_transaction(tx)
     }
 
     fn dummy_eth_transaction_zero() -> EthereumTransactionCommon {
         // corresponding caller's address is 0xf95abdf6ede4c3703e0e9453771fbee8592d31e9
         // private key 0xe922354a3e5902b5ac474f3ff08a79cff43533826b8f451ae2190b65a9d26158
-        let nonce = U256::zero();
-        let v = U256::from(37);
-        let r = string_to_h256_unsafe(
-            "451d603fc1e73bb8c7afda6d4a0ce635657c812262f8d35aa0400504cec5af03",
-        );
-        let s = string_to_h256_unsafe(
-            "562c20b430d8d137ef6ce0dc46a21f3ed4f810b7d27394af70684900be1a2e07",
-        );
-        dummy_eth_gen_transaction(nonce, v, r, s)
+        let nonce = 0;
+        make_dummy_transaction(nonce, TransactionType::Legacy)
     }
 
     fn dummy_eth_transaction_one() -> EthereumTransactionCommon {
         // corresponding caller's address is 0xf95abdf6ede4c3703e0e9453771fbee8592d31e9
         // private key 0xe922354a3e5902b5ac474f3ff08a79cff43533826b8f451ae2190b65a9d26158
-        let nonce = U256::one();
-        let v = U256::from(37);
-        let r = string_to_h256_unsafe(
-            "624ebca1a42237859de4f0f90e4d6a6e8f73ed014656929abfe5664a039d1fc5",
-        );
-        let s = string_to_h256_unsafe(
-            "4a08c518537102edd0c3c8c2125ef9ca45d32341a5b829a94b2f2f66e4f43eb0",
-        );
-        dummy_eth_gen_transaction(nonce, v, r, s)
+        let nonce = 1;
+        make_dummy_transaction(nonce, TransactionType::Legacy)
     }
 
     fn dummy_eth_transaction_deploy_from_nonce_and_pk(
         nonce: u64,
         private_key: &str,
     ) -> EthereumTransactionCommon {
-        let nonce = U256::from(nonce);
         let gas_price = U256::from(21000u64);
         // gas limit was estimated using Remix on Shanghai network (256,842)
         // plus a safety margin for gas accounting discrepancies
@@ -443,6 +608,11 @@ mod tests {
         let value = U256::zero();
         // corresponding contract is kernel_benchmark/scripts/benchmarks/contracts/storage.sol
         let data: Vec<u8> = hex::decode("608060405234801561001057600080fd5b5061017f806100206000396000f3fe608060405234801561001057600080fd5b50600436106100415760003560e01c80634e70b1dc1461004657806360fe47b1146100645780636d4ce63c14610080575b600080fd5b61004e61009e565b60405161005b91906100d0565b60405180910390f35b61007e6004803603810190610079919061011c565b6100a4565b005b6100886100ae565b60405161009591906100d0565b60405180910390f35b60005481565b8060008190555050565b60008054905090565b6000819050919050565b6100ca816100b7565b82525050565b60006020820190506100e560008301846100c1565b92915050565b600080fd5b6100f9816100b7565b811461010457600080fd5b50565b600081359050610116816100f0565b92915050565b600060208284031215610132576101316100eb565b5b600061014084828501610107565b9150509291505056fea2646970667358221220ec57e49a647342208a1f5c9b1f2049bf1a27f02e19940819f38929bf67670a5964736f6c63430008120033").unwrap();
+
+        let gas_for_fees =
+            crate::fees::gas_for_fees(DUMMY_DA_FEE.into(), gas_price, &data, &[])
+                .unwrap();
+        let gas_limit = gas_limit + gas_for_fees;
 
         let tx = EthereumTransactionCommon::new(
             tezos_ethereum::transaction::TransactionType::Legacy,
@@ -470,12 +640,13 @@ mod tests {
     }
 
     fn store_blueprints<Host: Runtime>(host: &mut Host, blueprints: Vec<Blueprint>) {
-        for blueprint in blueprints {
-            store_inbox_blueprint(host, blueprint).expect("Should have stored blueprint");
+        for (i, blueprint) in blueprints.into_iter().enumerate() {
+            store_inbox_blueprint_by_number(host, blueprint, U256::from(i))
+                .expect("Should have stored blueprint");
         }
     }
 
-    fn produce_block_with_several_valid_txs<Host: KernelRuntime>(
+    fn produce_block_with_several_valid_txs<Host: Runtime>(
         host: &mut Host,
         evm_account_storage: &mut EthereumAccountStorage,
     ) {
@@ -506,13 +677,13 @@ mod tests {
         produce(
             host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
     }
 
-    fn assert_current_block_reading_validity<Host: KernelRuntime>(host: &mut Host) {
+    fn assert_current_block_reading_validity<Host: Runtime>(host: &mut Host) {
         match storage::read_current_block(host) {
             Ok(_) => (),
             Err(e) => {
@@ -524,12 +695,12 @@ mod tests {
     #[test]
     // Test if the invalid transactions are producing receipts
     fn test_invalid_transactions_receipt_status() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let tx_hash = [0; TRANSACTION_HASH_SIZE];
 
@@ -552,8 +723,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -566,12 +737,12 @@ mod tests {
     #[test]
     // Test if a valid transaction is producing a receipt with a success status
     fn test_valid_transactions_receipt_status() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let tx_hash = [0; TRANSACTION_HASH_SIZE];
 
@@ -589,14 +760,14 @@ mod tests {
             &mut host,
             &mut evm_account_storage,
             &sender,
-            U256::from(5000000000000000u64),
+            U256::from(1_000_000_000_000_000_000u64),
         );
 
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -608,12 +779,12 @@ mod tests {
     #[test]
     // Test if a valid transaction is producing a receipt with a contract address
     fn test_valid_transactions_receipt_contract_address() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let tx_hash = [0; TRANSACTION_HASH_SIZE];
         let tx = dummy_eth_transaction_deploy();
@@ -641,8 +812,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
         let receipt = read_transaction_receipt(&mut host, &tx_hash)
@@ -661,12 +832,13 @@ mod tests {
     #[test]
     // Test if several valid transactions can be performed
     fn test_several_valid_transactions() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
+
         let mut evm_account_storage = init_account_storage().unwrap();
 
         produce_block_with_several_valid_txs(&mut host, &mut evm_account_storage);
@@ -682,12 +854,12 @@ mod tests {
     #[test]
     // Test if several valid proposals can produce valid blocks
     fn test_several_valid_proposals() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let tx_hash_0 = [0; TRANSACTION_HASH_SIZE];
         let tx_hash_1 = [1; TRANSACTION_HASH_SIZE];
@@ -719,8 +891,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -735,13 +907,18 @@ mod tests {
     #[test]
     // Test transfers gas consumption consistency
     fn test_cumulative_transfers_gas_consumption() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+
         let base_gas = U256::from(21000);
+        crate::storage::store_minimum_base_fee_per_gas(&mut host, base_gas).unwrap();
+        let dummy_block_fees = dummy_block_fees();
+        let gas_for_fees = crate::fees::gas_for_fees(
+            dummy_block_fees.da_fee_per_byte(),
+            dummy_block_fees.base_fee_per_gas(),
+            &[],
+            &[],
+        )
+        .unwrap();
 
         let tx_hash_0 = [0; TRANSACTION_HASH_SIZE];
         let tx_hash_1 = [1; TRANSACTION_HASH_SIZE];
@@ -771,8 +948,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees,
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
         let receipt0 = read_transaction_receipt(&mut host, &tx_hash_0)
@@ -780,10 +957,10 @@ mod tests {
         let receipt1 = read_transaction_receipt(&mut host, &tx_hash_1)
             .expect("should have found receipt");
 
-        assert_eq!(receipt0.cumulative_gas_used, base_gas);
+        assert_eq!(receipt0.cumulative_gas_used, base_gas + gas_for_fees);
         assert_eq!(
             receipt1.cumulative_gas_used,
-            receipt0.cumulative_gas_used + base_gas
+            receipt0.cumulative_gas_used + base_gas + gas_for_fees
         );
     }
 
@@ -791,12 +968,7 @@ mod tests {
     // Test if we're able to read current block (with a filled queue) after
     // a block production
     fn test_read_storage_current_block_after_block_production_with_filled_queue() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
 
         let mut evm_account_storage = init_account_storage().unwrap();
 
@@ -808,12 +980,12 @@ mod tests {
     #[test]
     // Test that the same transaction can not be replayed twice
     fn test_replay_attack() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let tx = Transaction {
             tx_hash: [0; TRANSACTION_HASH_SIZE],
@@ -827,19 +999,20 @@ mod tests {
         );
 
         let sender = dummy_eth_caller();
+        let initial_sender_balance = U256::from(10000000000000000000u64);
         let mut evm_account_storage = init_account_storage().unwrap();
         set_balance(
             &mut host,
             &mut evm_account_storage,
             &sender,
-            U256::from(10000000000000000000u64),
+            initial_sender_balance,
         );
 
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -849,19 +1022,29 @@ mod tests {
         let dest_balance =
             get_balance(&mut host, &mut evm_account_storage, &dest_address);
 
-        assert_eq!(sender_balance, U256::from(9999999159500000000u64));
-        assert_eq!(dest_balance, U256::from(500000000u64))
+        let expected_dest_balance = U256::from(500000000u64);
+        let expected_gas = 21000;
+        let da_fee = crate::fees::da_fee(DUMMY_DA_FEE.into(), &[], &[]);
+        let rounding_amount = 6000;
+        let expected_fees = dummy_block_fees().base_fee_per_gas() * expected_gas
+            + da_fee
+            + rounding_amount;
+        let expected_sender_balance =
+            initial_sender_balance - expected_dest_balance - expected_fees;
+
+        assert_eq!(dest_balance, expected_dest_balance);
+        assert_eq!(sender_balance, expected_sender_balance, "sender balance");
     }
 
     #[test]
     //Test accounts are indexed at the end of the block production
     fn test_accounts_are_indexed() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let accounts_index = init_account_index().unwrap();
 
@@ -876,18 +1059,19 @@ mod tests {
         let indexed_accounts = accounts_index.length(&host).unwrap();
 
         let sender = dummy_eth_caller();
+        println!("caller {sender:?}");
         let mut evm_account_storage = init_account_storage().unwrap();
         set_balance(
             &mut host,
             &mut evm_account_storage,
             &sender,
-            U256::from(5000000000000000u64),
+            U256::from(1_000_000_000_000_000_000u64),
         );
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -905,12 +1089,7 @@ mod tests {
     #[test]
     //Test accounts are indexed at the end of the block production
     fn test_accounts_are_indexed_once() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
 
         let accounts_index = init_account_index().unwrap();
 
@@ -925,8 +1104,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -936,8 +1115,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -952,12 +1131,12 @@ mod tests {
 
     #[test]
     fn test_blocks_and_transactions_are_indexed() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         let blocks_index = init_blocks_index().unwrap();
         let transaction_hashes_index = init_transaction_hashes_index().unwrap();
@@ -987,8 +1166,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -1026,28 +1205,16 @@ mod tests {
         let timestamp = current_timestamp(host);
         let timestamp = U256::from(timestamp.as_u64());
         let chain_id = retrieve_chain_id(host);
-        let base_fee_per_gas = retrieve_base_fee_per_gas(host);
+        let block_fees = retrieve_block_fees(host);
         assert!(chain_id.is_ok(), "chain_id should be defined");
-        assert!(
-            base_fee_per_gas.is_ok(),
-            "base_fee_per_gas should be defined"
-        );
-        BlockConstants::first_block(
-            timestamp,
-            chain_id.unwrap(),
-            base_fee_per_gas.unwrap(),
-        )
+        assert!(block_fees.is_ok(), "block fees should be defined");
+        BlockConstants::first_block(timestamp, chain_id.unwrap(), block_fees.unwrap())
     }
 
     #[test]
     fn test_stop_computation() {
         // init host
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
 
         let block_constants = first_block(&mut host);
         let precompiles = precompiles::precompile_set();
@@ -1068,22 +1235,29 @@ mod tests {
             tx_hash: [0; TRANSACTION_HASH_SIZE],
             content: TransactionContent::Ethereum(dummy_eth_transaction_zero()),
         };
-        let transactions = vec![valid_tx].into();
+        let transactions = vec![valid_tx.clone()].into();
 
         // init block in progress
         let mut block_in_progress =
             BlockInProgress::new(U256::from(1), U256::from(1), transactions);
-        // block is almost full wrt ticks
-        block_in_progress.estimated_ticks = tick_model::constants::MAX_TICKS - 1000;
+        // run is almost full wrt ticks
+        block_in_progress.estimated_ticks_in_run =
+            tick_model::constants::MAX_TICKS - 1000;
+
+        let data_length = valid_tx.data_size();
+        let ticks_for_invalid = tick_model::ticks_of_invalid_transaction(data_length);
 
         // act
         compute(
             &mut host,
+            &OutboxQueue::new(&WITHDRAWAL_OUTBOX_QUEUE, u32::MAX).unwrap(),
             &mut block_in_progress,
             &block_constants,
             &precompiles,
             &mut evm_account_storage,
             &mut accounts_index,
+            true,
+            &None,
         )
         .expect("Should have computed block");
 
@@ -1096,8 +1270,12 @@ mod tests {
             "should not have consumed any gas"
         );
         assert_eq!(
-            block_in_progress.estimated_ticks,
-            tick_model::constants::MAX_TICKS - 1000,
+            block_in_progress.estimated_ticks_in_run,
+            tick_model::constants::MAX_TICKS - 1000 + ticks_for_invalid,
+            "should not have consumed any tick"
+        );
+        assert_eq!(
+            block_in_progress.estimated_ticks_in_block, ticks_for_invalid,
             "should not have consumed any tick"
         );
 
@@ -1113,12 +1291,7 @@ mod tests {
 
     #[test]
     fn invalid_transaction_should_bump_nonce() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
 
         let mut evm_account_storage = init_account_storage().unwrap();
 
@@ -1130,13 +1303,13 @@ mod tests {
             .get_or_create(&host, &account_path(&caller).unwrap())
             .unwrap();
         let default_nonce = caller_account.nonce(&host).unwrap();
-        assert_eq!(default_nonce, U256::zero(), "default nonce should be 0");
+        assert_eq!(default_nonce, 0, "default nonce should be 0");
 
         let tx = dummy_eth_transaction_zero();
         // Ensures the caller has enough balance to pay for the fees, but not
         // the transaction itself, otherwise the transaction will not even be
         // taken into account.
-        let fees = U256::from(21000) * tx.execution_gas_limit();
+        let fees = U256::from(21000) * tx.gas_limit_with_fees();
         set_balance(&mut host, &mut evm_account_storage, &caller, fees);
 
         // Prepare a invalid transaction, i.e. with not enough funds.
@@ -1151,8 +1324,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
         assert!(
@@ -1188,12 +1361,7 @@ mod tests {
 
     #[test]
     fn test_first_blocks() {
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
 
         // first block should be 0
         let blueprint = almost_empty_blueprint();
@@ -1201,8 +1369,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("Empty block should have been produced");
         check_current_block_number(&mut host, 0);
@@ -1213,8 +1381,8 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("Empty block should have been produced");
         check_current_block_number(&mut host, 1);
@@ -1225,39 +1393,11 @@ mod tests {
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("Empty block should have been produced");
         check_current_block_number(&mut host, 2);
-    }
-
-    fn dummy_eth(nonce: u64) -> EthereumTransactionCommon {
-        let nonce = U256::from(nonce);
-        let gas_price = U256::from(40000000000u64);
-        let gas_limit = 21000;
-        let value = U256::from(1);
-        let to = address_from_str("423163e58aabec5daa3dd1130b759d24bef0f6ea");
-        let tx = EthereumTransactionCommon::new(
-            TransactionType::Legacy,
-            Some(U256::one()),
-            nonce,
-            gas_price,
-            gas_price,
-            gas_limit,
-            to,
-            value,
-            vec![],
-            vec![],
-            None,
-        );
-
-        // corresponding caller's address is 0xaf1276cbb260bb13deddb4209ae99ae6e497f446
-        tx.sign_transaction(
-            "dcdff53b4f013dbcdc717f89fe3bf4d8b10512aae282b48e01d7530470382701"
-                .to_string(),
-        )
-        .unwrap()
     }
 
     fn hash_from_nonce(nonce: u64) -> TransactionHash {
@@ -1267,36 +1407,73 @@ mod tests {
         hash
     }
 
-    fn dummy_transaction(nonce: u64) -> Transaction {
+    const CREATE_LOOP_DATA: &str = "608060405234801561001057600080fd5b506101d0806100206000396000f3fe608060405234801561001057600080fd5b506004361061002b5760003560e01c80630b7d796e14610030575b600080fd5b61004a600480360381019061004591906100c2565b61004c565b005b60005b81811015610083576001600080828254610069919061011e565b92505081905550808061007b90610152565b91505061004f565b5050565b600080fd5b6000819050919050565b61009f8161008c565b81146100aa57600080fd5b50565b6000813590506100bc81610096565b92915050565b6000602082840312156100d8576100d7610087565b5b60006100e6848285016100ad565b91505092915050565b7f4e487b7100000000000000000000000000000000000000000000000000000000600052601160045260246000fd5b60006101298261008c565b91506101348361008c565b925082820190508082111561014c5761014b6100ef565b5b92915050565b600061015d8261008c565b91507fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff820361018f5761018e6100ef565b5b60018201905091905056fea26469706673582212200cd6584173dbec22eba4ce6cc7cc4e702e00e018d340f84fc0ff197faf980ad264736f6c63430008150033";
+
+    const LOOP_1300: &str =
+        "0b7d796e0000000000000000000000000000000000000000000000000000000000000514";
+
+    const LOOP_4600: &str =
+        "0b7d796e00000000000000000000000000000000000000000000000000000000000011f8";
+
+    const LOOP_5800: &str =
+        "0b7d796e00000000000000000000000000000000000000000000000000000000000016a8";
+
+    const TEST_SK: &str =
+        "84e147b8bc36d99cc6b1676318a0635d8febc9f02897b0563ad27358589ee502";
+
+    const TEST_ADDR: &str = "f0affc80a5f69f4a9a3ee01a640873b6ba53e539";
+
+    fn create_and_sign_transaction(
+        data: &str,
+        nonce: u64,
+        gas_limit: u64,
+        to: Option<H160>,
+        secret_key: &str,
+    ) -> EthereumTransactionCommon {
+        let data = hex::decode(data).unwrap();
+
+        let gas_for_fees = crate::fees::gas_for_fees(
+            DUMMY_DA_FEE.into(),
+            DUMMY_BASE_FEE_PER_GAS.into(),
+            &data,
+            &[],
+        )
+        .unwrap();
+
+        let unsigned_tx = EthereumTransactionCommon::new(
+            TransactionType::Eip1559,
+            Some(DUMMY_CHAIN_ID),
+            nonce,
+            U256::from(DUMMY_BASE_FEE_PER_GAS),
+            U256::from(DUMMY_BASE_FEE_PER_GAS),
+            gas_limit + gas_for_fees,
+            to,
+            U256::zero(),
+            data,
+            vec![],
+            None,
+        );
+        unsigned_tx
+            .sign_transaction(String::from(secret_key))
+            .unwrap()
+    }
+
+    fn wrap_transaction(nonce: u64, tx: EthereumTransactionCommon) -> Transaction {
         Transaction {
             tx_hash: hash_from_nonce(nonce),
-            content: TransactionContent::Ethereum(dummy_eth(nonce)),
+            content: TransactionContent::Ethereum(tx),
         }
-    }
-
-    const TOO_MANY_TRANSACTIONS: u64 = 500;
-
-    fn is_marked_for_reboot(host: &impl SmartRollupCore) -> bool {
-        const REBOOT_PATH: RefPath = RefPath::assert_from(b"/kernel/env/reboot");
-        host.store_read_all(&REBOOT_PATH).is_ok()
-    }
-
-    fn assert_marked_for_reboot(host: &impl SmartRollupCore) {
-        assert!(
-            is_marked_for_reboot(host),
-            "The kernel should have been marked for reboot"
-        );
     }
 
     #[test]
     fn test_reboot_many_tx_one_proposal() {
         // init host
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         // sanity check: no current block
         assert!(
@@ -1305,7 +1482,7 @@ mod tests {
         );
 
         //provision sender account
-        let sender = H160::from_str("af1276cbb260bb13deddb4209ae99ae6e497f446").unwrap();
+        let sender = H160::from_str(TEST_ADDR).unwrap();
         let sender_initial_balance = U256::from(10000000000000000000u64);
         let mut evm_account_storage = init_account_storage().unwrap();
         set_balance(
@@ -1315,20 +1492,39 @@ mod tests {
             sender_initial_balance,
         );
 
-        let mut transactions = vec![];
-        for n in 0..TOO_MANY_TRANSACTIONS {
-            transactions.push(dummy_transaction(n));
-        }
+        // These transactions are generated with the loop.sol contract, which are:
+        // - create the contract
+        // - call `loop(1200)`
+        // - call `loop(4600)`
+        let create_transaction =
+            create_and_sign_transaction(CREATE_LOOP_DATA, 0, 3_000_000, None, TEST_SK);
+        let loop_addr: H160 =
+            evm_execution::utilities::create_address_legacy(&sender, &0);
+        let loop_1200_tx =
+            create_and_sign_transaction(LOOP_1300, 1, 900_000, Some(loop_addr), TEST_SK);
+        let loop_4600_tx = create_and_sign_transaction(
+            LOOP_4600,
+            2,
+            2_600_000,
+            Some(loop_addr),
+            TEST_SK,
+        );
 
-        store_blueprints(&mut host, vec![blueprint(transactions)]);
+        let proposals = vec![
+            wrap_transaction(0, create_transaction),
+            wrap_transaction(1, loop_1200_tx),
+            wrap_transaction(2, loop_4600_tx),
+        ];
+
+        store_blueprints(&mut host, vec![blueprint(proposals)]);
 
         host.reboot_left().expect("should be some reboot left");
 
-        produce(
+        let computation_result = produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("Should have produced");
 
@@ -1339,27 +1535,27 @@ mod tests {
         );
 
         // test reboot is set
-        assert_marked_for_reboot(host.host)
+        matches!(computation_result, ComputationResult::RebootNeeded);
     }
 
     #[test]
     fn test_reboot_many_tx_many_proposal() {
         // init host
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
 
         // sanity check: no current block
         assert!(
             storage::read_current_block_number(&host).is_err(),
             "Should not have found current block number"
         );
-
         //provision sender account
-        let sender = H160::from_str("af1276cbb260bb13deddb4209ae99ae6e497f446").unwrap();
+        let sender = H160::from_str(TEST_ADDR).unwrap();
         let sender_initial_balance = U256::from(10000000000000000000u64);
         let mut evm_account_storage = init_account_storage().unwrap();
         set_balance(
@@ -1369,38 +1565,60 @@ mod tests {
             sender_initial_balance,
         );
 
-        let mut transactions = vec![];
-        let mut proposals = vec![];
-        for n in 0..TOO_MANY_TRANSACTIONS {
-            transactions.push(dummy_transaction(n));
-            if n.rem(80) == 0 {
-                proposals.push(blueprint(transactions));
-                transactions = vec![];
-            }
-        }
+        // These transactions are generated with the loop.sol contract, which are:
+        // - create the contract
+        // - call `loop(1200)`
+        // - call `loop(4600)`
+        let create_transaction =
+            create_and_sign_transaction(CREATE_LOOP_DATA, 0, 3_000_000, None, TEST_SK);
+        let loop_addr: H160 =
+            evm_execution::utilities::create_address_legacy(&sender, &0);
+        let loop_1200_tx =
+            create_and_sign_transaction(LOOP_1300, 1, 900_000, Some(loop_addr), TEST_SK);
+        let loop_4600_tx = create_and_sign_transaction(
+            LOOP_4600,
+            2,
+            2_600_000,
+            Some(loop_addr),
+            TEST_SK,
+        );
+
+        let proposals = vec![
+            blueprint(vec![wrap_transaction(0, create_transaction)]),
+            blueprint(vec![
+                wrap_transaction(1, loop_1200_tx),
+                wrap_transaction(2, loop_4600_tx),
+            ]),
+        ];
 
         store_blueprints(&mut host, proposals);
 
-        produce(
+        let computation_result = produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            dummy_block_fees(),
+            &mut Configuration::default(),
         )
         .expect("Should have produced");
 
         // test no new block
-        assert!(
+        assert_eq!(
             storage::read_current_block_number(&host)
-                .expect("should have found a block number")
-                > U256::zero(),
-            "There should have been multiple blocks registered"
+                .expect("should have found a block number"),
+            U256::zero(),
+            "There should have been one block registered"
         );
 
         // test reboot is set
-        assert_marked_for_reboot(host.host);
+        matches!(computation_result, ComputationResult::RebootNeeded);
 
-        let bip = read_block_in_progress(&host)
+        // The block is in progress, therefore it is in the safe storage.
+        let mut mock_internal = MockHost::default();
+        let safe_host = SafeStorage {
+            host: &mut host,
+            internal: &mut mock_internal,
+        };
+        let bip = read_block_in_progress(&safe_host)
             .expect("Should be able to read the block in progress")
             .expect("The reboot context should have a block in progress");
 
@@ -1409,8 +1627,9 @@ mod tests {
             "There should be some transactions left"
         );
 
-        let _next_blueprint = read_next_blueprint(&mut host, &mut Configuration::Proxy)
-            .expect("The next blueprint should be available");
+        let _next_blueprint =
+            read_next_blueprint(&mut host, &mut Configuration::default())
+                .expect("The next blueprint should be available");
     }
 
     #[test]
@@ -1426,12 +1645,9 @@ mod tests {
         // address.
 
         // init host
-        let mut mock_host = MockHost::default();
-        let mut internal = MockInternal();
-        let mut host = SafeStorage {
-            host: &mut mock_host,
-            internal: &mut internal,
-        };
+        let mut host = MockHost::default();
+        // ensure we're using the default block fees to test.
+        let block_fees = crate::retrieve_block_fees(&mut host).unwrap();
 
         // see
         // https://basescan.org/tx/0x07471adfe8f4ec553c1199f495be97fc8be8e0626ae307281c22534460184ed1
@@ -1447,14 +1663,14 @@ mod tests {
         let transaction = EthereumTransactionCommon::from_bytes(&signed_transaction)
             .expect("The MultiCall3 transaction shouldn't be unparsable");
 
-        println!("Transaction: {:?}", transaction);
-
         let mut tx_hash = [0; TRANSACTION_HASH_SIZE];
         tx_hash.copy_from_slice(&expected_tx_hash);
 
+        // *NB*: due to the da fee, this will fail by default - so we inject it through the
+        // delayed inbox instead, so that it doesn't pay the da fee.
         let tx = Transaction {
             tx_hash,
-            content: Ethereum(transaction),
+            content: EthereumDelayed(transaction),
         };
 
         let transactions: Vec<Transaction> = vec![tx];
@@ -1467,14 +1683,14 @@ mod tests {
             &mut host,
             &mut evm_account_storage,
             &sender,
-            U256::from(500000000000000000u64),
+            U256::from(1_000_000_000_000_000_000u64),
         );
 
         produce(
             &mut host,
             DUMMY_CHAIN_ID,
-            DUMMY_BASE_FEE_PER_GAS.into(),
-            &mut Configuration::Proxy,
+            block_fees,
+            &mut Configuration::default(),
         )
         .expect("The block production failed.");
 
@@ -1486,5 +1702,177 @@ mod tests {
             .expect("Should have found receipt");
         assert_eq!(TransactionStatus::Success, receipt.status);
         assert_eq!(Some(expected_created_contract), receipt.contract_address);
+    }
+
+    #[test]
+    fn test_non_retriable_transaction_are_marked_as_failed() {
+        // init host
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
+
+        // sanity check: no current block
+        assert!(
+            storage::read_current_block_number(&host).is_err(),
+            "Should not have found current block number"
+        );
+
+        //provision sender account
+        let sender = H160::from_str(TEST_ADDR).unwrap();
+        let sender_initial_balance = U256::from(10000000000000000000u64);
+        let mut evm_account_storage = init_account_storage().unwrap();
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &sender,
+            sender_initial_balance,
+        );
+
+        // These transactions are generated with the loop.sol contract, which are:
+        // - create the contract
+        // - call `loop(1200)`
+        // - call `loop(5800)`
+        let create_transaction =
+            create_and_sign_transaction(CREATE_LOOP_DATA, 0, 3_000_000, None, TEST_SK);
+        let loop_addr: H160 =
+            evm_execution::utilities::create_address_legacy(&sender, &0);
+        let loop_5800_tx = create_and_sign_transaction(
+            LOOP_5800,
+            1,
+            4_000_000,
+            Some(loop_addr),
+            TEST_SK,
+        );
+
+        let proposals_first_reboot = vec![wrap_transaction(0, create_transaction)];
+
+        store_inbox_blueprint(&mut host, blueprint(proposals_first_reboot)).unwrap();
+
+        produce(
+            &mut host,
+            DUMMY_CHAIN_ID,
+            dummy_block_fees(),
+            &mut Configuration::default(),
+        )
+        .expect("Should have produced");
+
+        assert!(
+            storage::read_current_block_number(&host).is_ok(),
+            "Should have found a block"
+        );
+
+        // We start a new proposal, calling produce again simulates a reboot.
+
+        let proposals_second_reboot = vec![wrap_transaction(2, loop_5800_tx)];
+
+        store_inbox_blueprint(&mut host, blueprint(proposals_second_reboot)).unwrap();
+
+        produce(
+            &mut host,
+            DUMMY_CHAIN_ID,
+            dummy_block_fees(),
+            &mut Configuration::default(),
+        )
+        .expect("Should have produced");
+
+        let block = read_current_block(&mut host).expect("Should have found a block");
+        let failed_loop_hash = block
+            .transactions
+            .first()
+            .expect("There should have been a transaction");
+        let failed_loop_status =
+            storage::read_transaction_receipt_status(&mut host, failed_loop_hash)
+                .expect("There should have been a receipt");
+
+        assert_eq!(
+            failed_loop_status,
+            TransactionStatus::Failure,
+            "The transaction should have failed"
+        )
+    }
+
+    // Comment out `ignore` when resigning the dummy transactions
+    #[test]
+    #[ignore = "Only run when re-signing required"]
+    fn resign() {
+        println!("Dummy eth transactions");
+        // corresponding caller's address is 0xf95abdf6ede4c3703e0e9453771fbee8592d31e9
+        let private_key =
+            "e922354a3e5902b5ac474f3ff08a79cff43533826b8f451ae2190b65a9d26158";
+
+        let zero = dummy_eth_transaction_zero();
+        let one = dummy_eth_transaction_one();
+
+        let zero_resigned = zero.sign_transaction(private_key.to_string()).unwrap();
+        let one_resigned = one.sign_transaction(private_key.to_string()).unwrap();
+
+        assert_eq!(zero, zero_resigned);
+        assert_eq!(one, one_resigned);
+    }
+
+    #[test]
+    // Test if a valid transaction is producing a receipt with a success status
+    fn test_type_propagation() {
+        let mut host = MockHost::default();
+        crate::storage::store_minimum_base_fee_per_gas(
+            &mut host,
+            DUMMY_BASE_FEE_PER_GAS.into(),
+        )
+        .unwrap();
+
+        let tx_hash = [0; TRANSACTION_HASH_SIZE];
+        let tx_hash_eip1559 = [1; TRANSACTION_HASH_SIZE];
+        let tx_hash_eip2930 = [2; TRANSACTION_HASH_SIZE];
+
+        let valid_tx = Transaction {
+            tx_hash,
+            content: Ethereum(make_dummy_transaction(0, TransactionType::Legacy)),
+        };
+
+        let valid_tx_eip1559 = Transaction {
+            tx_hash: tx_hash_eip1559,
+            content: Ethereum(make_dummy_transaction(1, TransactionType::Eip1559)),
+        };
+
+        let valid_tx_eip2930 = Transaction {
+            tx_hash: tx_hash_eip2930,
+            content: Ethereum(make_dummy_transaction(2, TransactionType::Eip2930)),
+        };
+
+        let transactions: Vec<Transaction> =
+            vec![valid_tx, valid_tx_eip1559, valid_tx_eip2930];
+        store_blueprints(&mut host, vec![blueprint(transactions)]);
+
+        let sender = dummy_eth_caller();
+        let mut evm_account_storage = init_account_storage().unwrap();
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &sender,
+            U256::from(1_000_000_000_000_000_000u64),
+        );
+
+        produce(
+            &mut host,
+            DUMMY_CHAIN_ID,
+            dummy_block_fees(),
+            &mut Configuration::default(),
+        )
+        .expect("The block production failed.");
+
+        let receipt = read_transaction_receipt(&mut host, &tx_hash)
+            .expect("Should have found receipt");
+        assert_eq!(receipt.type_, TransactionType::Legacy);
+
+        let receipt_eip1559 = read_transaction_receipt(&mut host, &tx_hash_eip1559)
+            .expect("Should have found receipt");
+        assert_eq!(receipt_eip1559.type_, TransactionType::Eip1559);
+
+        let receipt_eip2930 = read_transaction_receipt(&mut host, &tx_hash_eip2930)
+            .expect("Should have found receipt");
+        assert_eq!(receipt_eip2930.type_, TransactionType::Eip2930);
     }
 }

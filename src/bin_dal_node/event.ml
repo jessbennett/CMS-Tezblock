@@ -35,6 +35,22 @@ let starting_node =
     ~level:Notice
     ()
 
+let waiting_l1_node_bootstrapped =
+  declare_0
+    ~section
+    ~name:"waiting_l1_node_to_be_bootstrapped"
+    ~msg:"waiting for the L1 node to be bootstrapped"
+    ~level:Notice
+    ()
+
+let l1_node_bootstrapped =
+  declare_0
+    ~section
+    ~name:"l1_node_is_bootstrapped"
+    ~msg:"the L1 node is bootstrapped"
+    ~level:Notice
+    ()
+
 let shutdown_node =
   declare_1
     ~section
@@ -238,3 +254,37 @@ let metrics_server_is_ready =
     ~level:Notice
     ("host", Data_encoding.string)
     ("port", Data_encoding.uint16)
+
+let loading_profiles_failed =
+  declare_1
+    ~section
+    ~name:"loading_profiles_failed"
+    ~msg:"loading profiles failed: {error}"
+    ~level:Error
+    ("error", Error_monad.trace_encoding)
+
+let saving_profiles_failed =
+  declare_1
+    ~section
+    ~name:"saving_profiles_failed"
+    ~msg:"saving profiles failed: {error}"
+    ~level:Error
+    ("error", Error_monad.trace_encoding)
+
+let reconstruct_started =
+  declare_1
+    ~section
+    ~name:"reconstruct_started"
+    ~msg:"slot reconstruction for commitment {commitment} started"
+    ~level:Notice
+    ~pp1:Cryptobox.Commitment.pp_short
+    ("commitment", Cryptobox.Commitment.encoding)
+
+let reconstruct_finished =
+  declare_1
+    ~section
+    ~name:"reconstruct_finished"
+    ~msg:"slot reconstruction for commitment {commitment} finished"
+    ~level:Notice
+    ~pp1:Cryptobox.Commitment.pp_short
+    ("commitment", Cryptobox.Commitment.encoding)

@@ -32,6 +32,7 @@
 *)
 
 open Adaptive_issuance_helpers
+module Cycle = Protocol.Alpha_context.Cycle
 
 let assert_level ~loc (blk : Block.t) expected =
   let current_level = blk.header.shell.level in
@@ -131,11 +132,11 @@ let test_launch threshold expected_vote_duration () =
         autostaking_enable = false;
       }
     in
-    let cost_per_byte = Tez.zero in
+    let cost_per_byte = Tez_helpers.zero in
     let issuance_weights =
       {
         Default_parameters.constants_test.issuance_weights with
-        base_total_issued_per_minute = Tez.zero;
+        base_total_issued_per_minute = Tez_helpers.zero;
       }
     in
     let consensus_threshold = 0 in
@@ -147,7 +148,7 @@ let test_launch threshold expected_vote_duration () =
       cost_per_byte;
     }
   in
-  let preserved_cycles = constants.preserved_cycles in
+  let delay = constants.consensus_rights_delay in
   let* block, delegate = Context.init_with_constants1 constants in
   let delegate_pkh = Context.Contract.pkh delegate in
   let* () = assert_is_not_yet_set_to_launch ~loc:__LOC__ block in
@@ -350,7 +351,7 @@ let test_launch threshold expected_vote_duration () =
   let* operation = stake (B block) wannabe_staker balance_to_stake in
   let* block = Block.bake ~operation block in
   (* The staking operation leads to an increase of the
-     total_frozen_stake but only preserved_cycles after the
+     total_frozen_stake but only consensus_rights_delay after the
      operation. *)
   let start_cycle = Block.current_cycle block in
   let* block =
@@ -362,8 +363,7 @@ let test_launch threshold expected_vote_duration () =
           (Protocol.Alpha_context.Tez.of_mutez_exn 2_000_000_000_000L))
       (fun block ->
         let current_cycle = Block.current_cycle block in
-        Protocol.Alpha_context.Cycle.(
-          current_cycle <= add start_cycle preserved_cycles))
+        Protocol.Alpha_context.Cycle.(current_cycle <= add start_cycle delay))
       block
   in
   let* block = Block.bake block in
@@ -471,7 +471,7 @@ let test_launch_without_vote () =
     let issuance_weights =
       {
         Default_parameters.constants_test.issuance_weights with
-        base_total_issued_per_minute = Tez.zero;
+        base_total_issued_per_minute = Tez_helpers.zero;
       }
     in
     let adaptive_issuance =
@@ -522,7 +522,7 @@ let test_launch_without_vote () =
       (fun block ->
         let current_cycle = Block.current_cycle block in
         Protocol.Alpha_context.Cycle.(
-          current_cycle <= add start_cycle constants.preserved_cycles))
+          current_cycle <= add start_cycle constants.consensus_rights_delay))
       block
   in
   let* block = Block.bake block in

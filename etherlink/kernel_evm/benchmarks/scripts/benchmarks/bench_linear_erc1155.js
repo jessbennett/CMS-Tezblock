@@ -11,7 +11,9 @@ let faucet = require('./players/faucet.json');
 let player1 = require('./players/player1.json');
 let player2 = require('./players/player2.json');
 
-let nb_iter = process.argv.length > 2 ? process.argv[2] : 1;
+let mode = utils.bench_args(process.argv, [{flag: '--count <n>', desc: 'Number of transfers', default: 0}]);
+
+let nb_iter = mode.extra.count > 2 ? mode.extra.count : 1;
 if (nb_iter < 0) nb_iter = 0;
 
 // Using `MyMultiToken`
@@ -51,10 +53,10 @@ let gasLimit = 3_000_000;
 
 let txs = [];
 txs.push(utils.transfer(faucet, player1, 100000000000));
-let create = utils.create(player1, 0, create_data);
+let create = utils.create(player1, 0, create_data, { gasLimit: 1000000000 });
 txs.push(create.tx);
-txs.push(utils.send(player1, create.addr, 0, batchMint_data, gasLimit));
+txs.push(utils.send(player1, create.addr, 0, batchMint_data, {gasLimit}));
 for (let i = 0; i < nb_iter; i++) {
-    txs.push(utils.send(player1, create.addr, 0, safeBatchTransferFrom_data, gasLimit));
+    txs.push(utils.send(player1, create.addr, 0, safeBatchTransferFrom_data, {gasLimit}));
 }
-utils.print_bench([txs]);
+utils.print_bench([txs], mode);

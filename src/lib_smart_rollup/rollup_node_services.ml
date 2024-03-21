@@ -91,6 +91,14 @@ type gc_info = {
   last_context_split_level : int32 option;
 }
 
+type sync_result =
+  | Synchronized
+  | Synchronizing of {
+      processed_level : int32;
+      l1_head_level : int32;
+      percentage_done : float;
+    }
+
 module Encodings = struct
   open Data_encoding
 
@@ -107,9 +115,7 @@ module Encodings = struct
       (opt "published_at_level" int32)
 
   let queued_message =
-    obj2
-      (req "hash" L2_message.Hash.encoding)
-      (req "message" L2_message.encoding)
+    obj2 (req "id" L2_message.Id.encoding) (req "message" L2_message.encoding)
 
   let batcher_queue = list queued_message
 
@@ -271,6 +277,33 @@ module Encodings = struct
          (req "last_gc_level" int32)
          (req "first_available_level" int32)
          (opt "last_context_split_level" int32)
+
+  let synchronization_result =
+    union
+      [
+        case
+          ~title:"synchronized"
+          (Tag 0)
+          (constant "synchronized")
+          (function Synchronized -> Some () | _ -> None)
+          (fun () -> Synchronized);
+        case
+          ~title:"synchronizing"
+          (Tag 1)
+          (obj1
+             (req
+                "synchronizing"
+                (obj3
+                   (req "processed_level" int32)
+                   (req "l1_head_level" int32)
+                   (req "percentage_done" float))))
+          (function
+            | Synchronizing {processed_level; l1_head_level; percentage_done} ->
+                Some (processed_level, l1_head_level, percentage_done)
+            | _ -> None)
+          (fun (processed_level, l1_head_level, percentage_done) ->
+            Synchronizing {processed_level; l1_head_level; percentage_done});
+      ]
 end
 
 module Arg = struct
@@ -305,14 +338,14 @@ module Arg = struct
       ~destruct:destruct_block_id
       ()
 
-  let l2_message_hash : L2_message.hash Tezos_rpc.Arg.t =
+  let l2_message_id : L2_message.id Tezos_rpc.Arg.t =
     Tezos_rpc.Arg.make
-      ~descr:"A L2 message hash."
-      ~name:"l2_message_hash"
-      ~construct:L2_message.Hash.to_b58check
+      ~descr:"A L2 message id."
+      ~name:"l2_message_id"
+      ~construct:L2_message.Id.to_b58check
       ~destruct:(fun s ->
-        L2_message.Hash.of_b58check_opt s
-        |> Option.to_result ~none:"Invalid L2 message hash")
+        L2_message.Id.of_b58check_opt s
+        |> Option.to_result ~none:"Invalid L2 message id")
       ()
 
   let commitment_hash : Commitment.Hash.t Tezos_rpc.Arg.t =
@@ -457,9 +490,9 @@ module Local = struct
       ~output:
         Data_encoding.(
           def
-            "message_hashes"
-            ~description:"Hashes of injected L2 messages"
-            (list L2_message.Hash.encoding))
+            "message_ids"
+            ~description:"Ids of injected L2 messages"
+            (list L2_message.Id.encoding))
       (path / "batcher" / "injection")
 
   let batcher_queue =
@@ -474,7 +507,16 @@ module Local = struct
       ~description:"Retrieve an L2 message and its status"
       ~query:Tezos_rpc.Query.empty
       ~output:Encodings.message_status_output
-      (path / "batcher" / "queue" /: Arg.l2_message_hash)
+      (path / "batcher" / "queue" /: Arg.l2_message_id)
+
+  let synchronized =
+    Tezos_rpc.Service.get_service
+      ~description:
+        "Wait for the node to have synchronized its L2 chain with the L1 \
+         chain, streaming its progress."
+      ~query:Tezos_rpc.Query.empty
+      ~output:Encodings.synchronization_result
+      (path / "synchronized")
 end
 
 module Root = struct

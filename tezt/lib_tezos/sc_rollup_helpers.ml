@@ -128,10 +128,10 @@ type installer_result = {
    it by using the 'reveal_installer' kernel. This leverages the reveal
    preimage+DAC mechanism to install the tx kernel.
 *)
-let prepare_installer_kernel ?runner ~preimages_dir ?config installee =
+let prepare_installer_kernel_with_arbitrary_file ?runner ~preimages_dir ?config
+    installee =
   let open Tezt.Base in
   let open Lwt.Syntax in
-  let installee = Uses.path installee in
   let installer =
     installee |> Filename.basename |> Filename.remove_extension |> fun base ->
     base ^ "-installer.hex"
@@ -191,6 +191,13 @@ let prepare_installer_kernel ?runner ~preimages_dir ?config installee =
   in
   {output; boot_sector = read_file output; root_hash}
 
+let prepare_installer_kernel ?runner ~preimages_dir ?config installee =
+  prepare_installer_kernel_with_arbitrary_file
+    ?runner
+    ~preimages_dir
+    ?config
+    (Uses.path installee)
+
 let default_boot_sector_of ~kind =
   match kind with
   | "arith" -> ""
@@ -208,8 +215,8 @@ let make_bool_parameter name = function
   | Some value -> [([name], `Bool value)]
 
 let setup_l1 ?timestamp ?bootstrap_smart_rollups ?bootstrap_contracts
-    ?commitment_period ?challenge_window ?timeout ?whitelist_enable ?rpc_local
-    ?(riscv_pvm_enable = false) protocol =
+    ?commitment_period ?challenge_window ?timeout ?whitelist_enable
+    ?rpc_external ?(riscv_pvm_enable = false) protocol =
   let parameters =
     make_parameter "smart_rollup_commitment_period_in_blocks" commitment_period
     @ make_parameter "smart_rollup_challenge_window_in_blocks" challenge_window
@@ -239,7 +246,7 @@ let setup_l1 ?timestamp ?bootstrap_smart_rollups ?bootstrap_contracts
     `Client
     ~protocol
     ~nodes_args
-    ?rpc_local
+    ?rpc_external
     ()
 
 (** This helper injects an SC rollup origination via octez-client. Then it

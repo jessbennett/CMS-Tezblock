@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: 2023 Functori <contact@functori.com>
 // SPDX-FileCopyrightText: 2023 Nomadic Labs <contact@nomadic-labs.com>
+// SPDX-FileCopyrightText: 2024 Trilitech <contact@trili.tech>
 //
 // SPDX-License-Identifier: MIT
 
-use crate::blueprint_storage;
 use crate::error::Error;
 use crate::error::UpgradeProcessError::Fallback;
 use crate::storage::{
-    self, read_storage_version, store_storage_version, STORAGE_VERSION,
+    read_chain_id, read_storage_version, store_storage_version, STORAGE_VERSION,
 };
-use tezos_smart_rollup_host::runtime::Runtime;
+use tezos_smart_rollup_host::runtime::{Runtime, RuntimeError};
 
 pub enum MigrationStatus {
     None,
@@ -17,15 +17,21 @@ pub enum MigrationStatus {
     Done,
 }
 
-// In proxy mode, the value of `EVM_LAST_BLUEPRINT` indicates the number of
-// the last stored blueprint. This is used to store the next blueprint when
-// created from the inbox. If missing, the implementation of
-// `blueprint_storage` assumes the next blueprint should be number 0.
-// Therefore, migration needs to set this value to the current block's
-// number.
-fn migrate_blueprint_storage<Host: Runtime>(host: &mut Host) -> Result<(), Error> {
-    let head_number = storage::read_current_block_number(host)?;
-    blueprint_storage::store_last_blueprint_number(host, head_number)
+// /!\ the following functions are migratin helpers, do not remove them /!\
+
+#[allow(dead_code)]
+fn is_etherlink_ghostnet(host: &impl Runtime) -> anyhow::Result<bool> {
+    let chain_id = read_chain_id(host)?;
+    Ok(chain_id == 128123.into())
+}
+
+#[allow(dead_code)]
+fn allow_path_not_found(res: Result<(), RuntimeError>) -> Result<(), RuntimeError> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(RuntimeError::PathNotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 // The workflow for migration is the following:
@@ -46,11 +52,10 @@ fn migrate_blueprint_storage<Host: Runtime>(host: &mut Host) -> Result<(), Error
 //     in an inconsistent storage.
 // /!\
 //
-fn migration<Host: Runtime>(host: &mut Host) -> Result<MigrationStatus, Error> {
+fn migration<Host: Runtime>(host: &mut Host) -> anyhow::Result<MigrationStatus> {
     let current_version = read_storage_version(host)?;
     if STORAGE_VERSION == current_version + 1 {
         // MIGRATION CODE - START
-        migrate_blueprint_storage(host)?;
         // MIGRATION CODE - END
         store_storage_version(host, STORAGE_VERSION)?;
         return Ok(MigrationStatus::Done);

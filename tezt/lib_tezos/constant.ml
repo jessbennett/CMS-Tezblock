@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2020 Nomadic Labs <contact@nomadic-labs.com>                *)
 (* Copyright (c) 2020 Metastate AG <hello@metastate.dev>                     *)
+(* Copyright (c) 2024 Trilitech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -102,17 +103,11 @@ module WASM = struct
       ~path:
         "etherlink/kernel_evm/kernel/tests/resources/ghostnet_evm_kernel.wasm"
 
+  let ghostnet_evm_commit = "0a81ce76b3d4f57d8c5194bcb9418f9294fd2be1"
+
   let tx_kernel = Uses.make ~tag:"tx_kernel" ~path:"tx_kernel.wasm"
 
   let tx_kernel_dal = Uses.make ~tag:"tx_kernel_dal" ~path:"tx_kernel_dal.wasm"
-
-  (* Note: this should probably depend on the protocol,
-     and thus be in the [Protocol] module? *)
-  let tx_kernel_fixed_dac =
-    Uses.make
-      ~tag:"tx_kernel_fixed_dac"
-      ~path:
-        "src/proto_alpha/lib_protocol/test/integration/wasm_kernel/tx-kernel-fixed-dac.wasm"
 end
 
 (* TODO: tezos/tezos#4803
@@ -125,6 +120,16 @@ let released_executables = "./script-inputs/released-executables"
 (* We use the [experimental-executables] script input as source of
    experimental executable binaries to test. *)
 let experimental_executables = "./script-inputs/experimental-executables"
+
+(** Default hostname to use for endpoints when no specific one is required. *)
+let default_host =
+  (* The value of [default_host] is set to ["127.0.0.1"] because the
+     alternatives have the following drawbacks :
+     - Using ["localhost"] leads to an extra consumption of RAM
+       (https://gitlab.com/tezos/tezos/-/issues/6789).
+     - There are or were some problems with IPv6 on GCP.
+  *)
+  "127.0.0.1"
 
 (** Key pair used to activate a protocol from genesis with [--network sandbox].
     The public key is hard-coded in the node. *)

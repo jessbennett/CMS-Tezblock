@@ -70,6 +70,8 @@ module Node_store = struct
         save_when_rw Full
     | Some Full, Some Archive ->
         failwith "Cannot transform a full rollup node into an archive one."
+
+  let of_store store = store
 end
 
 type debug_logger = string -> unit Lwt.t
@@ -85,6 +87,12 @@ type last_whitelist_update = {message_index : int; outbox_level : Int32.t}
 type private_info = {
   last_whitelist_update : last_whitelist_update;
   last_outbox_level_searched : int32;
+}
+
+type sync_info = {
+  on_synchronized : unit Lwt_condition.t;
+  mutable processed_level : int32;
+  sync_level_input : int32 Lwt_watcher.input;
 }
 
 type 'a t = {
@@ -108,6 +116,7 @@ type 'a t = {
   finaliser : unit -> unit Lwt.t;
   mutable current_protocol : current_protocol;
   global_block_watcher : Sc_rollup_block.t Lwt_watcher.input;
+  sync : sync_info;
 }
 
 type rw = [`Read | `Write] t
@@ -269,8 +278,15 @@ let save_l2_block {store; _} (head : Sc_rollup_block.t) =
     ~header:head.header
     ~value:head_info
 
-let set_l2_head {store; _} (head : Sc_rollup_block.t) =
-  Store.L2_head.write store.l2_head head
+let notify_processed_tezos_level node_ctxt level =
+  node_ctxt.sync.processed_level <- level ;
+  Lwt_watcher.notify node_ctxt.sync.sync_level_input level
+
+let set_l2_head node_ctxt (head : Sc_rollup_block.t) =
+  let open Lwt_result_syntax in
+  let+ () = Store.L2_head.write node_ctxt.store.l2_head head in
+  notify_processed_tezos_level node_ctxt head.header.level ;
+  Lwt_watcher.notify node_ctxt.global_block_watcher head
 
 let is_processed {store; _} head = Store.L2_blocks.mem store.l2_blocks head
 
@@ -894,18 +910,6 @@ let save_slot_status {store; _} current_block_hash slot_index status =
     ~secondary_key:slot_index
     status
 
-let find_confirmed_slots_history {store; _} block =
-  Store.Dal_confirmed_slots_history.find store.irmin_store block
-
-let save_confirmed_slots_history {store; _} block hist =
-  Store.Dal_confirmed_slots_history.add store.irmin_store block hist
-
-let find_confirmed_slots_histories {store; _} block =
-  Store.Dal_confirmed_slots_histories.find store.irmin_store block
-
-let save_confirmed_slots_histories {store; _} block hist =
-  Store.Dal_confirmed_slots_histories.add store.irmin_store block hist
-
 let get_gc_levels node_ctxt =
   let open Lwt_result_syntax in
   let+ gc_levels = Store.Gc_levels.read node_ctxt.store.gc_levels in
@@ -1007,6 +1011,20 @@ let check_level_available node_ctxt accessed_level =
     (accessed_level < first_available_level)
     (Rollup_node_errors.Access_below_first_available_level
        {first_available_level; accessed_level})
+
+(** {2 Synchronization tracking} *)
+
+let is_synchronized node_ctxt =
+  let l1_head = Layer1.get_latest_head node_ctxt.l1_ctxt in
+  match l1_head with
+  | None -> true
+  | Some l1_head -> node_ctxt.sync.processed_level = l1_head.level
+
+let wait_synchronized node_ctxt =
+  if is_synchronized node_ctxt then Lwt.return_unit
+  else Lwt_condition.wait node_ctxt.sync.on_synchronized
+
+(**/**)
 
 module Internal_for_tests = struct
   let write_protocols_in_store (store : [> `Write] store) =

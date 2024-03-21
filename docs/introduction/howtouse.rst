@@ -31,8 +31,8 @@ After a successful compilation, you should have the following binaries:
 The daemons other than the node are suffixed with the name of the protocol they are
 bound to.
 More precisely, the suffix consists of the first 8 characters of the protocol hash; except for protocol Alpha, for which the suffix is simply ``-alpha``.
-For instance, ``octez-baker-PtNairob`` is the baker
-for the Nairobi protocol, and ``octez-baker-alpha`` is the baker
+For instance, ``octez-baker-Proxford`` is the baker
+for the Oxford protocol, and ``octez-baker-alpha`` is the baker
 of the development protocol.
 The ``octez-node`` daemon is not suffixed by any protocol name, because it is independent of the economic protocol. See also the `Node's Protocol`_ section below.
 
@@ -145,7 +145,7 @@ Note that this is merely a network identity and it is not related in
 any way to a Tezos address on the blockchain.
 
 If you wish to run your node on a test network, now is also a good time
-to configure your node (see :ref:`builtin_networks`).
+to configure your node for it (see :doc:`../user/multinetwork`).
 
 Node Synchronization
 ~~~~~~~~~~~~~~~~~~~~
@@ -215,7 +215,7 @@ Many options of the node can be configured when running the node:
 
 - RPC parameters (e.g. the port number for listening to RPC requests using option ``--rpc-addr``)
 - The directory where the node stores local data (using option ``--data-dir``)
-- Network parameters (e.g. the number of connections to peers, using option ``--connections``)
+- Network parameters (e.g. the network to connect to, using option ``--network``, the number of connections to peers, using option ``--connections``)
 - Validator and mempool parameters
 - :ref:`Logging options <configure_node_logging>`.
 
@@ -252,7 +252,12 @@ Client
 
 Octez client can be used to interact with the node, it can query its
 status or ask the node to perform some actions.
-For example, after starting your node you can check if it has finished
+
+.. note::
+
+  The rest of this page assumes that you have launched a local node, as explained in the previous section. But it is useful to know that the client can be configured to interact with a public node instead, either using :doc:`the configuration file <../user/client-configuration>` or by supplying option ``-E <node-url>`` with `a public RPC node <https://docs.tezos.com/architecture/rpc#public-and-private-rpc-nodes>`__.
+
+After starting your local node you can check if it has finished
 synchronizing (see :doc:`../shell/sync`) using::
 
    octez-client bootstrapped
@@ -322,7 +327,7 @@ Get Free Test Tokens
 ~~~~~~~~~~~~~~~~~~~~
 
 To test the networks and help users get familiar with the system, on
-:doc:`test networks<../global/test_networks>` you can obtain free tokens from
+:ref:`test networks <test_networks>` you can obtain free tokens from
 :ref:`a faucet <faucet>`. Transfer some to Alice's address.
 
 Transfers and Receipts
@@ -341,7 +346,7 @@ Let's try::
   octez-client transfer 1 from alice to bob --dry-run
 
   Fatal error:
-    The operation will burn ꜩ0.257 which is higher than the configured burn cap (ꜩ0).
+    The operation will burn 0.257 tez which is higher than the configured burn cap (0 tez).
      Use `--burn-cap 0.257` to emit this operation.
 
 The client asks the node to validate the operation (without sending
@@ -352,7 +357,7 @@ Any storage on chain has a cost associated to it which should be
 accounted for either by paying a fee to a baker or by destroying
 (``burning``) some tez.
 This is particularly important to protect the system from spam.
-Because storing an address requires burning ꜩ0.257 and the client has
+Because storing an address requires burning 0.257 tez and the client has
 a default of 0, we need to explicitly set a cap on the amount that we
 allow to burn::
 
@@ -440,16 +445,21 @@ included anymore in a block.
 Furthermore each operation has a counter that prevents replays so it is usually safe to re-emit an
 operation that seems lost.
 
+.. _block_explorers:
+
+Block Explorers
+~~~~~~~~~~~~~~~
+
+Once your transaction is included in a block, you can retrieve it in one of the `public block explorers <https://docs.tezos.com/developing/information/block-explorers>`__, which list the whole history of the different Tezos networks (mainnet or test networks).
 
 .. _originated-accounts:
 
 Implicit Accounts and Smart Contracts
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In Tezos there are two kinds of accounts: *implicit accounts* and *smart contracts*.
+In Tezos there are two kinds of accounts: *implicit accounts* and *smart contracts* (see :doc:`../active/accounts` for more details).
 
-- The implicit accounts are the addresses starting with *tz1*, *tz2*,
-  and *tz3* we have used up to now. They are created with a transfer
+- Addresses with a *tz* prefix, like the *tz1* public key hashes used above,  represent implicit accounts. They are created with a transfer
   operation to the account's public key hash.
 
 - Smart contracts have addresses starting with *KT1* and are created
@@ -463,7 +473,7 @@ Let's originate our first contract and call it *id*::
                  running ./michelson_test_scripts/attic/id.tz \
                  --init '"hello"' --burn-cap 0.4
 
-The initial balance is ꜩ1, generously provided by implicit account
+The initial balance is 1 tez, generously provided by implicit account
 *alice*. The contract stores a Michelson program ``id.tz``
 (found in file :src:`michelson_test_scripts/attic/id.tz`), with
 Michelson value ``"hello"`` as initial storage (the extra quotes are
@@ -497,7 +507,7 @@ Gas and Storage Costs
 ~~~~~~~~~~~~~~~~~~~~~
 
 A quick look at the balance updates on the receipt shows that on top of
-funding the contract with ꜩ1, *alice* was also charged an extra cost
+funding the contract with 1 tez, *alice* was also charged an extra cost
 that is burnt.
 This cost comes from the *storage* and is shown in the line
 ``Paid storage size diff: 46 bytes``, 41 for the contract and 5 for
@@ -600,7 +610,7 @@ have to resort to RPCs.
 
 For example to check the value of important
 :ref:`constants <protocol_constants>` in Tezos, which may differ between Mainnet and other
-:ref:`test networks<test-networks>`, you can use::
+:ref:`test networks<test_networks>`, you can use::
 
    octez-client rpc get /chains/main/blocks/head/context/constants | jq
    {

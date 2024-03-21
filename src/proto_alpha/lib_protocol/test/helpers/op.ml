@@ -34,7 +34,7 @@ let pack_operation ctxt signature contents =
 let sign ?(watermark = Signature.Generic_operation) sk branch contents =
   let unsigned =
     Data_encoding.Binary.to_bytes_exn
-      Operation.unsigned_encoding_with_legacy_attestation_name
+      Operation.unsigned_encoding
       ({branch}, Contents_list contents)
   in
   let signature = Some (Signature.sign ~watermark sk unsigned) in
@@ -133,48 +133,6 @@ let attestation ?delegate ?slot ?level ?round ?block_payload_hash ?dal_content
       attested_block
   in
   return (Operation.pack op)
-
-let raw_dal_attestation ?delegate ?attestation block =
-  let open Lwt_result_wrap_syntax in
-  let ctxt = Context.B block in
-  let*? level = Context.get_level ctxt in
-  let*?@ round = Block.get_round block in
-  let* committee = Context.Dal.shards ctxt () in
-  let delegate =
-    match delegate with None -> Stdlib.List.hd committee |> fst | Some d -> d
-  in
-  match
-    List.assoc ~equal:Signature.Public_key_hash.equal delegate committee
-  with
-  | None -> return_none
-  | Some _interval -> (
-      let* slots = Context.get_attester_slot ctxt delegate in
-      match slots with
-      | None -> return_none
-      | Some slots -> (
-          match List.hd slots with
-          | None -> assert false
-          | Some slot ->
-              let attestation =
-                Option.value attestation ~default:Dal.Attestation.empty
-              in
-              let branch = block.Block.header.shell.predecessor in
-              let* signer = Account.find delegate in
-              let op =
-                Single (Dal_attestation {attestation; level; round; slot})
-              in
-              sign
-                ~watermark:
-                  Operation.(to_watermark (Dal_attestation Chain_id.zero))
-                signer.sk
-                branch
-                op
-              |> return_some))
-
-let dal_attestation ?delegate ?attestation block =
-  let open Lwt_result_wrap_syntax in
-  let* op = raw_dal_attestation ?delegate ?attestation block in
-  return (Option.map Operation.pack op)
 
 let raw_preattestation ?delegate ?slot ?level ?round ?block_payload_hash ?branch
     attested_block =
@@ -837,7 +795,7 @@ let dummy_script =
       storage = lazy_expr (strip_locations (Prim ((), D_Unit, [], [])));
     }
 
-let dummy_script_cost = Test_tez.of_mutez_exn 9_500L
+let dummy_script_cost = Tez_helpers.of_mutez 9_500L
 
 let transfer_ticket ?force_reveal ?counter ?fee ?gas_limit ?storage_limit ctxt
     ~(source : Contract.t) ~contents ~ty ~ticketer ~amount ~destination
@@ -1003,8 +961,8 @@ let sc_rollup_timeout ?force_reveal ?counter ?fee ?gas_limit ?storage_limit ctxt
   let+ account = Context.Contract.manager ctxt src in
   sign account.sk (Context.branch ctxt) to_sign_op
 
-let dal_publish_slot_header ?force_reveal ?counter ?fee ?gas_limit
-    ?storage_limit ctxt (src : Contract.t) slot_header =
+let dal_publish_commitment ?force_reveal ?counter ?fee ?gas_limit ?storage_limit
+    ctxt (src : Contract.t) slot_header =
   let open Lwt_result_syntax in
   let* to_sign_op =
     manager_operation
@@ -1015,7 +973,7 @@ let dal_publish_slot_header ?force_reveal ?counter ?fee ?gas_limit
       ?storage_limit
       ~source:src
       ctxt
-      (Dal_publish_slot_header slot_header)
+      (Dal_publish_commitment slot_header)
   in
   let+ account = Context.Contract.manager ctxt src in
   sign account.sk (Context.branch ctxt) to_sign_op

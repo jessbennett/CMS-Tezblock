@@ -1,9 +1,10 @@
-// SPDX-FileCopyrightText: 2023 Functori <contact@functori.com>
+// SPDX-FileCopyrightText: 2023-2024 Functori <contact@functori.com>
 // SPDX-FileCopyrightText: 2021-2023 draganrakita
 // SPDX-FileCopyrightText: 2024 Trilitech <contact@trili.tech>
 //
 // SPDX-License-Identifier: MIT
 
+use bytes::Bytes;
 use evm_execution::account_storage::{
     init_account_storage, EthereumAccount, EthereumAccountStorage,
 };
@@ -11,7 +12,7 @@ use evm_execution::handler::ExecutionOutcome;
 use evm_execution::precompiles::{precompile_set, PrecompileBTreeMap};
 use evm_execution::{run_transaction, Config, EthereumError};
 
-use tezos_ethereum::block::BlockConstants;
+use tezos_ethereum::block::{BlockConstants, BlockFees};
 
 use hex_literal::hex;
 use primitive_types::{H160, H256, U256};
@@ -27,8 +28,8 @@ use crate::fillers::{output_result, process, TestResult};
 use crate::helpers::{
     construct_folder_path, string_of_hexa, LabelIndexes, OutputOptions,
 };
-use crate::models::{Env, FillerSource, SpecName, Test, TestSuite, TestUnit};
-use crate::{write_host, DiffMap, Opt, ReportMap};
+use crate::models::{Env, FillerSource, SkipData, SpecName, Test, TestSuite, TestUnit};
+use crate::{write_host, write_out, DiffMap, Opt, ReportMap};
 
 const MAP_CALLER_KEYS: [(H256, H160); 6] = [
     (
@@ -131,7 +132,7 @@ fn initialize_accounts(host: &mut EvalHost, unit: &TestUnit) {
         let mut account =
             EthereumAccount::from_address(&address.as_fixed_bytes().into()).unwrap();
         if info.nonce != 0 {
-            account.set_nonce(host, info.nonce.into()).unwrap();
+            account.set_nonce(host, info.nonce).unwrap();
             write_host!(host, "Nonce is set for {} : {}", address, info.nonce);
         }
         account.balance_add(host, info.balance).unwrap();
@@ -157,6 +158,7 @@ fn initialize_env(unit: &TestUnit) -> Result<Env, TestError> {
     env.block.timestamp = unit.env.current_timestamp;
     env.block.gas_limit = unit.env.current_gas_limit;
     env.block.basefee = unit.env.current_base_fee.unwrap_or_default();
+    env.block.prevrandao = unit.env.current_random;
 
     // TxEnv
     env.tx.caller = if let Some(caller) =
@@ -167,13 +169,17 @@ fn initialize_env(unit: &TestUnit) -> Result<Env, TestError> {
         let private_key = unit.transaction.secret_key.unwrap();
         return Err(TestError::UnknownPrivateKey { private_key });
     };
-    env.tx.gas_price = unit
-        .transaction
-        .gas_price
-        .unwrap_or_else(|| unit.transaction.max_fee_per_gas.unwrap_or_default());
+    env.tx.gas_price = unit.transaction.gas_price.unwrap_or(
+        env.block.basefee
+            + unit
+                .transaction
+                .max_priority_fee_per_gas
+                .unwrap_or_default(),
+    );
     Ok(env)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_transaction(
     host: &mut EvalHost,
     evm_account_storage: &mut EthereumAccountStorage,
@@ -182,26 +188,25 @@ fn execute_transaction(
     unit: &TestUnit,
     env: &mut Env,
     test: &Test,
+    data: Bytes,
 ) -> Result<Option<ExecutionOutcome>, EthereumError> {
     let gas_limit = *unit.transaction.gas_limit.get(test.indexes.gas).unwrap();
     let gas_limit = u64::try_from(gas_limit).unwrap_or(u64::MAX);
     env.tx.gas_limit = gas_limit;
-    env.tx.data = unit
-        .transaction
-        .data
-        .get(test.indexes.data)
-        .unwrap()
-        .clone();
+    env.tx.data = data;
     env.tx.value = *unit.transaction.value.get(test.indexes.value).unwrap();
     env.tx.transact_to = unit.transaction.to;
+
+    let block_fees = BlockFees::new(env.block.basefee, env.block.basefee, U256::zero());
 
     let block_constants = BlockConstants {
         number: env.block.number,
         coinbase: env.block.coinbase.to_fixed_bytes().into(),
         timestamp: env.block.timestamp,
         gas_limit: env.block.gas_limit.as_u64(),
-        base_fee_per_gas: env.block.basefee,
+        block_fees,
         chain_id: U256::from(1337),
+        prevrandao: env.block.prevrandao,
     };
     let address = env.tx.transact_to.map(|addr| addr.to_fixed_bytes().into());
     let caller = env.tx.caller.to_fixed_bytes().into();
@@ -234,7 +239,18 @@ fn execute_transaction(
         transaction_value,
         pay_for_gas,
         u64::MAX, // don't account for ticks during the test
+        false,
+        true,
     )
+}
+
+fn data_to_skip(data: &[u8], skip_data: &SkipData) -> bool {
+    for skip_data in skip_data.datas.iter() {
+        if data == skip_data {
+            return true;
+        }
+    }
+    false
 }
 
 fn check_results(
@@ -289,17 +305,18 @@ pub fn run_test(
     report_map: &mut ReportMap,
     report_key: String,
     opt: &Opt,
-    output_file: &mut File,
+    output_file: &mut Option<File>,
     skip: bool,
     diff_result_map: &mut DiffMap,
     output: &OutputOptions,
+    skip_data: &SkipData,
 ) -> Result<(), TestError> {
     let suit = read_testsuite(path)?;
     let mut host = prepare_host();
 
     for (name, unit) in suit.0.into_iter() {
         if output.log {
-            writeln!(output_file, "Running unit test: {}", name).unwrap();
+            write_out!(output_file, "Running unit test: {}", name);
         }
         let precompiles = precompile_set::<EvalHost>();
         let mut evm_account_storage = init_account_storage().unwrap();
@@ -343,8 +360,19 @@ pub fn run_test(
                 let data_label = info.labels.get(&data);
                 if let Some(data_label) = data_label {
                     if output.log {
-                        writeln!(output_file, "Executing test {}", data_label).unwrap();
+                        write_out!(output_file, "Executing test {}", data_label);
                     }
+                }
+
+                let data = unit
+                    .transaction
+                    .data
+                    .get(test_execution.indexes.data)
+                    .unwrap()
+                    .clone();
+
+                if data_to_skip(&data, skip_data) {
+                    continue;
                 }
 
                 let exec_result = execute_transaction(
@@ -355,6 +383,7 @@ pub fn run_test(
                     &unit,
                     &mut env,
                     test_execution,
+                    data,
                 );
 
                 let labels = LabelIndexes {
@@ -364,19 +393,28 @@ pub fn run_test(
                 };
                 // Check the state after the execution of the result.
                 match filler_source.clone() {
-                    Some(filler_source) => process(
-                        &mut host,
-                        filler_source,
-                        spec_name,
-                        report_map,
-                        report_key.clone(),
-                        output_file,
-                        labels,
-                        &test_execution.indexes,
-                        output,
-                        &name,
-                        diff_result_map,
-                    ),
+                    Some(filler_source) => {
+                        let result = process(
+                            &mut host,
+                            filler_source,
+                            spec_name,
+                            report_map,
+                            report_key.clone(),
+                            output_file,
+                            labels,
+                            &test_execution.indexes,
+                            output,
+                            &name,
+                            diff_result_map,
+                        );
+                        if opt.ci_mode && result == TestResult::Failure {
+                            panic!(
+                                "The execution isn't 100% compatible anymore. \
+                                 Use the evaluation assessor to output debug traces and \
+                                 find the issue."
+                            )
+                        }
+                    }
                     None => write_host!(
                         host,
                         "No filler file, the outcome of this test is uncertain."

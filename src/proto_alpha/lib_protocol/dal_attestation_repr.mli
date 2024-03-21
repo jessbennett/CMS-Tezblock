@@ -30,9 +30,8 @@
     For the data-availability layer, the layer 1 provides a list of
    slots at every level (see {!Dal_slot_repr}). Slots are not posted
    directly onto L1 blocks. Stakeholders, called attesters in this
-   context, can commit on the availability of the data (via
-   attestation operations, see
-   https://gitlab.com/tezos/tezos/-/issues/3115).
+   context, can attest on the availability of the data via
+   attestation operations.
 
     The slot is uniformly split into shards. Each attester commits,
    for every slot, on the availability of all shards they are assigned
@@ -43,27 +42,6 @@
    overloading the network, this representation should be compact.  *)
 
 type t = private Bitset.t
-
-(** The shape of Dal attestation operations injected by delegates. *)
-type operation = {
-  attestation : t;
-      (** The bitset of slots that are attested to be available. *)
-  level : Raw_level_repr.t;
-      (** Similar to {!Operation_repr.consensus_content.level}. It is the level
-          at which the operation is valid in the mempool. It is the predecessor
-          at the level of the block that contains it. It should be equal to the
-          attested slot's published level plus the DAL attestation lag minus
-          one. Whenever there is a need to disambiguate, one should use
-          "attestation level" for the level inside the operation and "attested
-          level" for the level of the block. We have:
-          - [attestation_level + 1 = attested_level]
-          - [published_level + attestation_lag = attested_level] *)
-  round : Round_repr.t;
-      (** Similar to {!Operation_repr.consensus_content.round}. *)
-  slot : Slot_repr.t;
-      (** Similar to {!Operation_repr.consensus_content.slot}. It is the
-          attester's first consensus slot at [level]. *)
-}
 
 (** The size of the encoding is not bounded. However, the size of a DAL
     attestation bitset is checked during validation of an attestation; and there
@@ -119,24 +97,23 @@ module Accountability : sig
      Consider using the [Bounded] module. In particular, change the
      semantics of [is_slot_attested] accordingly. *)
 
-  (** [init ~length] initialises a new accountability data-structure
-     with at most [length] slots and where for every slot, no shard is
+  (** [init ~number_of_slots] initialises a new accountability data-structure
+     with [number_of_slots] slots and where for every slot, no shard is
      available. *)
-  val init : length:int -> t
+  val init : number_of_slots:int -> t
 
-  (** [record_attested_shards t slots shards] records that for all
-     slots declared available in [slots], the shard indices in [shards]
-     are deemed available. It is the responsibility of the caller to ensure
-     the shard indices are positive numbers. A negative shard index is
-     ignored. *)
-  val record_attested_shards : t -> attested_slots -> shard_index list -> t
+  (** [record_number_of_attested_shards t slots number] records that, for all
+      slots declared available in [slots], the given [number] of shard indices
+      are deemed available. This function must be called at most once for a
+      given attester; otherwise the count will be flawed. *)
+  val record_number_of_attested_shards : t -> attested_slots -> int -> t
 
-  (** [is_slot_attested t ~threshold ~number_of_shards slot] returns
-     [true] if the number of shards recorded in [t] for the [slot] is
-     above the [threshold] with respect to the total number of shards
-     specified by [number_of_shards]. Returns [false] otherwise or if
-     the [index] is out of the interval [0;length] where [length] is
-     the value provided to the [init] function. *)
+  (** [is_slot_attested t ~threshold ~number_of_shards slot] returns [true] if
+      the number of shards recorded in [t] for the [slot] is above the
+      [threshold] with respect to the total number of shards specified by
+      [number_of_shards]. Returns [false] otherwise or if the [index] is out of
+      the interval [0; number_of_slots - 1] where [number_of_slots] is the value
+      provided to the [init] function. *)
   val is_slot_attested :
     t -> threshold:int -> number_of_shards:int -> Dal_slot_index_repr.t -> bool
 end

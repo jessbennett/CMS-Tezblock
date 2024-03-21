@@ -98,6 +98,17 @@ val get_commitment_proof :
   ; query : unit >
   service
 
+(** Compute the proof associated to the page whose index is given of the given
+    slot. *)
+val get_page_proof :
+  < input : Cryptobox.slot
+  ; meth : [`POST]
+  ; output : Cryptobox.page_proof
+  ; params : unit * Types.page_index
+  ; prefix : unit
+  ; query : unit >
+  service
+
 (** Compute and save the shards of the slot associated to the given
     commitment. If the input's flag is true, the proofs associated with the
     computed shards are also computed and stored in memory. *)
@@ -285,6 +296,15 @@ module P2P : sig
     val get_peer_info :
       < meth : [`GET]
       ; input : unit
+      ; output : Types.P2P.Peer.Info.t
+      ; prefix : unit
+      ; params : unit * P2p_peer.Id.t
+      ; query : unit >
+      service
+
+    val patch_peer :
+      < meth : [`PATCH]
+      ; input : [`Ban | `Trust | `Open] option
       ; output : Types.P2P.Peer.Info.t
       ; prefix : unit
       ; params : unit * P2p_peer.Id.t

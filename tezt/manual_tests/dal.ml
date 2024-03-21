@@ -51,7 +51,7 @@ let dal_parameters () =
   Test.register
     ~__FILE__
     ~title:"Check the validity of DAL parameters"
-    ~tags:["dal"; "parameters"]
+    ~tags:[Tag.tezos2; "dal"; "parameters"]
   @@ fun () ->
   let open Dal.Cryptobox in
   let number_of_shards = Cli.get_int "number_of_shards" in
@@ -63,8 +63,7 @@ let dal_parameters () =
   in
   match Internal_for_tests.ensure_validity_without_srs parameters with
   | Ok _ ->
-      Internal_for_tests.parameters_initialisation parameters
-      |> Internal_for_tests.load_parameters ;
+      Internal_for_tests.init_prover_dal () ;
       let _ = make parameters in
       unit
   | Error (`Fail s) ->
@@ -101,7 +100,7 @@ let start_dal_node ~peers ?data_dir ?net_addr ?net_port ?rpc_addr ?rpc_port
     match (net_addr, net_port) with
     | None, None -> None
     | Some addr, None -> Some (sf "%s:%d" addr @@ Port.fresh ())
-    | None, Some port -> Some (sf "127.0.0.1:%d" port)
+    | None, Some port -> Some (sf "%s:%d" Constant.default_host port)
     | Some addr, Some port -> Some (sf "%s:%d" addr port)
   in
   let public_addr =
@@ -113,7 +112,7 @@ let start_dal_node ~peers ?data_dir ?net_addr ?net_port ?rpc_addr ?rpc_port
     match (metrics_addr, metrics_port) with
     | None, None -> None
     | Some addr, None -> Some (sf "%s:%d" addr @@ Port.fresh ())
-    | None, Some port -> Some (sf "127.0.0.1:%d" port)
+    | None, Some port -> Some (sf "%s:%d" Constant.default_host port)
     | Some addr, Some port -> Some (sf "%s:%d" addr port)
   in
 
@@ -342,7 +341,7 @@ let slots_injector_scenario ?publisher_sk ~airdropper_alias client dal_node
   let* level = Client.level client in
   loop level
 
-let _stake_or_unstake_half_balance client ~baker_alias =
+let stake_or_unstake_half_balance client ~baker_alias =
   let* baker = Client.show_address ~alias:baker_alias client in
   let* full_balance =
     Client.RPC.call client
@@ -391,11 +390,9 @@ let baker_scenario ?baker_sk ~airdropper_alias client dal_node l1_node =
   (* No need to check if baker_alias is already delegate. Re-registering an
      already registered delegate doesn't fail. *)
   let* _s = Client.register_delegate ~delegate:baker_alias client in
-  (* TODO: manual staking has been disabled in Oxford-2 (after being enabled in
-      rejected Oxford-1) in favor of automatic staking. So, this command
-      currently fails. But, it might be reactivated in protocol P.
-     let* () = _stake_or_unstake_half_balance client ~baker_alias in
-  *)
+  (* Manually stake a part of the baker's balance
+     after it is declared as delegate. *)
+  let* () = stake_or_unstake_half_balance client ~baker_alias in
   let baker = Baker.create ~protocol:Protocol.Alpha ~dal_node l1_node client in
   let* () = Baker.run baker in
   Lwt_unix.sleep Float.max_float
@@ -419,7 +416,7 @@ let slots_injector_test ~network =
   Test.register
     ~__FILE__
     ~title:(sf "Join %s and inject slots" network)
-    ~tags:["dal"; "slot"; "producer"; network]
+    ~tags:[Tag.tezos2; "dal"; "slot"; "producer"; network]
   @@ fun () ->
   let slot_index = Cli.get_int "slot-index" in
   let publisher_sk = Cli.get_string_opt "publisher-sk" in
@@ -451,7 +448,7 @@ let baker_test ~network =
   Test.register
     ~__FILE__
     ~title:(sf "Join %s and bake" network)
-    ~tags:["dal"; "baker"; network]
+    ~tags:[Tag.tezos2; "dal"; "baker"; network]
     ~uses:[Protocol.baker Alpha]
   @@ fun () ->
   let baker_sk = Cli.get_string_opt "baker-sk" in

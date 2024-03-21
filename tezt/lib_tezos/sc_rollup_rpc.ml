@@ -68,12 +68,12 @@ let get_local_batcher_queue () =
   make GET ["local"; "batcher"; "queue"] (fun json ->
       JSON.as_list json
       |> List.map @@ fun o ->
-         let hash = JSON.(o |-> "hash" |> as_string) in
+         let id = JSON.(o |-> "id" |> as_string) in
          let hex_msg = JSON.(o |-> "message" |-> "content" |> as_string) in
-         (hash, Hex.to_string (`Hex hex_msg)))
+         (id, Hex.to_string (`Hex hex_msg)))
 
-let get_local_batcher_queue_msg_hash ~msg_hash =
-  make GET ["local"; "batcher"; "queue"; msg_hash] (fun json ->
+let get_local_batcher_queue_msg_id ~msg_id =
+  make GET ["local"; "batcher"; "queue"; msg_id] (fun json ->
       if JSON.is_null json then failwith "Message is not in the queue"
       else
         let hex_msg = JSON.(json |-> "content" |> as_string) in
@@ -257,28 +257,6 @@ let outbox_proof_simple ?(block = "head") ~outbox_level ~message_index () =
       string_of_int outbox_level;
       "messages";
     ]
-    (fun json ->
-      let open JSON in
-      let commitment_hash = json |-> "commitment" |> as_string in
-      let proof_string = json |-> "proof" |> as_string in
-      (* There is 0x return in the proof hash as it is a hex *)
-      let proof_hex = sf "0x%s" proof_string in
-      Some {commitment_hash; proof = proof_hex})
-
-let outbox_proof_single ?(block = "head") ~message_index ~outbox_level ~message
-    () =
-  let open RPC_core in
-  let query_string =
-    [
-      ("message_index", string_of_int message_index);
-      ("outbox_level", string_of_int outbox_level);
-      ("serialized_outbox_message", Hex.to_string (`Hex message));
-    ]
-  in
-  make
-    ~query_string
-    GET
-    ["global"; "block"; block; "helpers"; "proofs"; "outbox"]
     (fun json ->
       let open JSON in
       let commitment_hash = json |-> "commitment" |> as_string in

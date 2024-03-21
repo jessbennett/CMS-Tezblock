@@ -59,31 +59,43 @@ module type S = sig
   type ('file, 'key, 'value) t
 
   val init :
-    lru_size:int ->
-    ('file -> ('key, 'value) Key_value_store.layout) ->
-    ('file, 'key, 'value) t
+    lru_size:int -> root_dir:string -> ('file, 'key, 'value) t tzresult Lwt.t
 
-  val close : ('file, 'key, 'value) t -> unit Lwt.t
+  val close : ('file, 'key, 'value) t -> unit tzresult Lwt.t
 
   val write_value :
     ?override:bool ->
     ('file, 'key, 'value) t ->
+    ('file, 'key, 'value) Key_value_store.file_layout ->
     'file ->
     'key ->
     'value ->
     unit tzresult Lwt.t
 
   val read_value :
-    ('file, 'key, 'value) t -> 'file -> 'key -> 'value tzresult Lwt.t
+    ('file, 'key, 'value) t ->
+    ('file, 'key, 'value) Key_value_store.file_layout ->
+    'file ->
+    'key ->
+    'value tzresult Lwt.t
 
   val read_values :
     ('file, 'key, 'value) t ->
+    ('file, 'key, 'value) Key_value_store.file_layout ->
     ('file * 'key) Seq.t ->
     ('file * 'key * 'value tzresult) Seq_s.t
 
-  val remove_file : ('file, 'key, 'value) t -> 'file -> unit tzresult Lwt.t
+  val remove_file :
+    ('file, 'key, 'value) t ->
+    ('file, 'key, 'value) Key_value_store.file_layout ->
+    'file ->
+    unit tzresult Lwt.t
 
-  val count_values : ('file, 'key, 'value) t -> 'file -> int tzresult Lwt.t
+  val count_values :
+    ('file, 'key, 'value) t ->
+    ('file, 'key, 'value) Key_value_store.file_layout ->
+    'file ->
+    int tzresult Lwt.t
 end
 
 let value_size = 1
@@ -93,38 +105,38 @@ module L : S = Key_value_store
 module R : S = struct
   type ('file, 'key, 'value) t = ('file * 'key, 'value) Stdlib.Hashtbl.t
 
-  let init ~lru_size:_ _file = Stdlib.Hashtbl.create 100
+  let init ~lru_size:_ ~root_dir:_ = Lwt.return_ok @@ Stdlib.Hashtbl.create 100
 
-  let close _ = Lwt.return_unit
+  let close _ = Lwt_syntax.return_ok_unit
 
-  let write_value ?(override = false) t file key value =
+  let write_value ?(override = false) t _file_layout file key value =
     let open Lwt_result_syntax in
     if override || not (Stdlib.Hashtbl.mem t (file, key)) then (
       Stdlib.Hashtbl.replace t (file, key) value ;
       return_unit)
     else return_unit
 
-  let read_value t file key =
+  let read_value t _file_layout file key =
     let key = (file, key) in
     let open Lwt_result_syntax in
     match Stdlib.Hashtbl.find_opt t key with
     | None -> failwith "key not found"
     | Some key -> return key
 
-  let read_values t seq =
+  let read_values t file_layout seq =
     let open Lwt_syntax in
     seq |> Seq_s.of_seq
     |> Seq_s.S.map (fun (file, key) ->
-           let* value = read_value t file key in
+           let* value = read_value t file_layout file key in
            Lwt.return (file, key, value))
 
-  let remove_file t file =
+  let remove_file t _file_layout file =
     Stdlib.Hashtbl.filter_map_inplace
       (fun (file', _) value -> if file = file' then None else Some value)
       t ;
     Lwt.return (Ok ())
 
-  let count_values t file =
+  let count_values t _file_layout file =
     Lwt_result_syntax.return
     @@ Stdlib.Hashtbl.fold
          (fun (file', _) _ count -> if file = file' then count + 1 else count)
@@ -423,23 +435,23 @@ let run_scenario
   let pid = Unix.getpid () in
   let tmp_dir = Filename.get_temp_dir_name () in
   (* To avoid any conflict with previous runs of this test. *)
-  let dir_path =
+  let root_dir =
     Format.asprintf "key-value-store-test-key-%d-%d" pid t.uid
     |> Filename.concat "tezos-pbt-tests"
     |> Filename.concat tmp_dir
   in
-  let*! () = Lwt_utils_unix.create_dir dir_path in
-  let layout_of dir =
-    let filepath = Filename.concat dir_path dir in
+  let file_layout ~root_dir file =
+    let filepath = Filename.concat root_dir file in
     Key_value_store.layout
       ~encoding:(Data_encoding.Fixed.bytes value_size)
       ~filepath
       ~eq:( = )
       ~index_of:Fun.id
+      ~number_of_keys_per_file:4096
       ()
   in
-  let left = L.init ~lru_size layout_of in
-  let right = R.init ~lru_size layout_of in
+  let* left = L.init ~lru_size ~root_dir in
+  let* right = R.init ~lru_size ~root_dir in
   let action, next_actions = scenario in
   let n = ref 0 in
   let compare_tzresult finalization pp_while pp_val left_result right_result =
@@ -455,7 +467,7 @@ let run_scenario
         pp_while
         ()
         !n
-        dir_path
+        root_dir
         pp_result
         right_result
         pp_result
@@ -488,14 +500,16 @@ let run_scenario
       | Write_value {override; default; key = file, key} ->
           let value = value_of_key ~default file key in
           let left_promise =
-            let* r = L.write_value ~override left file key value in
+            let* r = L.write_value ~override left file_layout file key value in
             return r
           in
-          let right_promise = R.write_value ~override right file key value in
+          let right_promise =
+            R.write_value ~override right file_layout file key value
+          in
           tzjoin [left_promise; right_promise]
       | Read_value (file, key) ->
-          let left_promise = L.read_value left file key in
-          let right_promise = R.read_value right file key in
+          let left_promise = L.read_value left file_layout file key in
+          let right_promise = R.read_value right file_layout file key in
           let*! left_result = left_promise in
           let*! right_result = right_promise in
           compare_result
@@ -505,23 +519,23 @@ let run_scenario
             right_result
       | Read_values seq ->
           let left_promise =
-            let seq_s = L.read_values left seq in
+            let seq_s = L.read_values left file_layout seq in
             Seq_s.E.iter (fun _ -> Ok ()) seq_s
           in
           let right_promise =
-            let seq_s = R.read_values right seq in
+            let seq_s = R.read_values right file_layout seq in
             Seq_s.E.iter (fun _ -> Ok ()) seq_s
           in
           tzjoin [left_promise; right_promise]
       | Remove_file file ->
-          let left_promise = L.remove_file left file in
+          let left_promise = L.remove_file left file_layout file in
 
-          let right_promise = R.remove_file right file in
+          let right_promise = R.remove_file right file_layout file in
 
           tzjoin [left_promise; right_promise]
       | Count_values file ->
-          let left_promise = L.count_values left file in
-          let right_promise = R.count_values right file in
+          let left_promise = L.count_values left file_layout file in
+          let right_promise = R.count_values right file_layout file in
           let*! left_result = left_promise in
           let*! right_result = right_promise in
           compare_tzresult
@@ -532,12 +546,12 @@ let run_scenario
             right_result
     in
     let finalize () =
-      let left = L.init ~lru_size:number_of_files layout_of in
+      let* left = L.init ~lru_size:number_of_files ~root_dir in
       let* () =
         Seq.ES.iter
           (fun (file, key) ->
-            let*! left_result = L.read_value left file key in
-            let*! right_result = R.read_value right file key in
+            let*! left_result = L.read_value left file_layout file key in
+            let*! right_result = R.read_value right file_layout file key in
             compare_result
               ~finalization:true
               (file, key)
@@ -555,7 +569,7 @@ let run_scenario
             (function Ok () -> return_unit | Error err -> fail err)
             promises_running_seq
         in
-        let* () = finalize () in
+        let* _ = finalize () in
         return (left, right)
     | (Sequential, action) :: next_actions ->
         let* () = promise in
@@ -572,7 +586,7 @@ let run_scenario
         run_actions action next_actions promises_running_seq
   in
   let* result = run_actions action next_actions Seq_s.empty in
-  let*! () = L.close left in
+  let*! _ = L.close left in
   return result
 
 let print (parameters, scenario) =

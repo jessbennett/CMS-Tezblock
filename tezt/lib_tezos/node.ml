@@ -57,7 +57,8 @@ type argument =
   | Disable_mempool
   | Version
   | RPC_additional_addr of string
-  | RPC_additional_addr_local of string
+  | RPC_additional_addr_external of string
+  | Max_active_rpc_connections of int
 
 let make_argument = function
   | Network x -> ["--network"; x]
@@ -88,7 +89,9 @@ let make_argument = function
   | Disable_mempool -> ["--disable-mempool"]
   | Version -> ["--version"]
   | RPC_additional_addr addr -> ["--rpc-addr"; addr]
-  | RPC_additional_addr_local addr -> ["--local-rpc-addr"; addr]
+  | RPC_additional_addr_external addr -> ["--external-rpc-addr"; addr]
+  | Max_active_rpc_connections n ->
+      ["--max-active-rpc-connections"; string_of_int n]
 
 let make_arguments arguments = List.flatten (List.map make_argument arguments)
 
@@ -110,7 +113,8 @@ let is_redundant = function
   | No_bootstrap_peers, No_bootstrap_peers
   | Media_type _, Media_type _
   | Metadata_size_limit _, Metadata_size_limit _
-  | Version, Version ->
+  | Version, Version
+  | Max_active_rpc_connections _, Max_active_rpc_connections _ ->
       true
   | Metrics_addr addr1, Metrics_addr addr2 -> addr1 = addr2
   | Peer peer1, Peer peer2 -> peer1 = peer2
@@ -133,8 +137,9 @@ let is_redundant = function
   | Cors_origin _, _
   | Disable_mempool, _
   | RPC_additional_addr _, _
-  | RPC_additional_addr_local _, _
-  | Version, _ ->
+  | RPC_additional_addr_external _, _
+  | Version, _
+  | Max_active_rpc_connections _, _ ->
       false
 
 (* Some arguments should not be written in the config file by [Node.init]
@@ -158,11 +163,12 @@ module Parameters = struct
     advertised_net_port : int option;
     metrics_addr : string option;
     metrics_port : int;
-    rpc_local : bool;
+    rpc_external : bool;
     rpc_host : string;
     rpc_port : int;
     rpc_tls : tls_config option;
     allow_all_rpc : bool;
+    max_active_rpc_connections : int;
     default_expected_pow : int;
     mutable default_arguments : argument list;
     mutable arguments : argument list;
@@ -209,7 +215,7 @@ let advertised_net_port node = node.persistent_state.advertised_net_port
 let rpc_scheme node =
   match node.persistent_state.rpc_tls with Some _ -> "https" | None -> "http"
 
-let rpc_local node = node.persistent_state.rpc_local
+let rpc_external node = node.persistent_state.rpc_external
 
 let rpc_host node = node.persistent_state.rpc_host
 
@@ -706,8 +712,9 @@ let wait_for_disconnections node disconnections =
 
 let create ?runner ?(path = Uses.path Constant.octez_node) ?name ?color
     ?data_dir ?event_pipe ?net_addr ?net_port ?advertised_net_port ?metrics_addr
-    ?metrics_port ?(rpc_local = false) ?(rpc_host = "localhost") ?rpc_port
-    ?rpc_tls ?(allow_all_rpc = true) arguments =
+    ?metrics_port ?(rpc_external = false) ?(rpc_host = Constant.default_host)
+    ?rpc_port ?rpc_tls ?(allow_all_rpc = true)
+    ?(max_active_rpc_connections = 500) arguments =
   let name = match name with None -> fresh_name () | Some name -> name in
   let data_dir =
     match data_dir with None -> Temp.dir ?runner name | Some dir -> dir
@@ -738,12 +745,13 @@ let create ?runner ?(path = Uses.path Constant.octez_node) ?name ?color
         net_addr;
         net_port;
         advertised_net_port;
-        rpc_local;
+        rpc_external;
         rpc_host;
         rpc_port;
         rpc_tls;
         metrics_addr;
         metrics_port;
+        max_active_rpc_connections;
         allow_all_rpc;
         default_arguments = arguments;
         arguments;
@@ -808,9 +816,14 @@ let runlike_command_arguments node command arguments =
   let net_addr, rpc_addr, metrics_addr =
     match node.persistent_state.runner with
     | None ->
-        ( Option.value ~default:"127.0.0.1" node.persistent_state.net_addr ^ ":",
+        ( Option.value
+            ~default:Constant.default_host
+            node.persistent_state.net_addr
+          ^ ":",
           node.persistent_state.rpc_host ^ ":",
-          Option.value ~default:"127.0.0.1" node.persistent_state.metrics_addr
+          Option.value
+            ~default:Constant.default_host
+            node.persistent_state.metrics_addr
           ^ ":" )
     | Some _ ->
         (* FIXME spawn an ssh tunnel in case of remote host *)
@@ -845,9 +858,11 @@ let runlike_command_arguments node command arguments =
   :: (net_addr ^ string_of_int node.persistent_state.net_port)
   :: "--metrics-addr"
   :: (metrics_addr ^ string_of_int node.persistent_state.metrics_port)
-  :: (if node.persistent_state.rpc_local then "--local-rpc-addr"
+  :: (if node.persistent_state.rpc_external then "--external-rpc-addr"
      else "--rpc-addr")
   :: (rpc_addr ^ string_of_int node.persistent_state.rpc_port)
+  :: "--max-active-rpc-connections"
+  :: string_of_int node.persistent_state.max_active_rpc_connections
   :: command_args
 
 let do_runlike_command ?(on_terminate = fun _ -> ()) ?event_level
@@ -894,11 +909,12 @@ let run ?patch_config ?on_terminate ?event_level ?event_sections_levels node
     arguments
 
 let replay ?on_terminate ?event_level ?event_sections_levels ?(strict = false)
-    ?(blocks = ["head"]) node arguments =
+    ?(blocks = ["head"]) node =
+  (* Select the appropriated arguments as the replay command does not
+     support all the node default arguments. *)
   let strict = if strict then ["--strict"] else [] in
-  let arguments =
-    runlike_command_arguments node "replay" arguments @ strict @ blocks
-  in
+  let directory = ["--data-dir"; node.persistent_state.data_dir] in
+  let arguments = ["replay"] @ directory @ strict @ blocks in
   do_runlike_command
     ?on_terminate
     ?event_level
@@ -907,7 +923,7 @@ let replay ?on_terminate ?event_level ?event_sections_levels ?(strict = false)
     arguments
 
 let init ?runner ?path ?name ?color ?data_dir ?event_pipe ?net_port
-    ?advertised_net_port ?metrics_addr ?metrics_port ?rpc_local ?rpc_host
+    ?advertised_net_port ?metrics_addr ?metrics_port ?rpc_external ?rpc_host
     ?rpc_port ?rpc_tls ?event_level ?event_sections_levels ?patch_config
     ?snapshot arguments =
   let run_arguments, config_arguments =
@@ -925,7 +941,7 @@ let init ?runner ?path ?name ?color ?data_dir ?event_pipe ?net_port
       ?advertised_net_port
       ?metrics_addr
       ?metrics_port
-      ?rpc_local
+      ?rpc_external
       ?rpc_host
       ?rpc_port
       ?rpc_tls

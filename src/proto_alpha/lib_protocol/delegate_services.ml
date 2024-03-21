@@ -108,6 +108,13 @@ let consensus_key_info_encoding =
                 consensus_key_encoding))
           []))
 
+let min_delegated_in_current_cycle_encoding =
+  let open Data_encoding in
+  conv
+    (fun (min_delegated, anchor) -> (min_delegated, anchor))
+    (fun (min_delegated, anchor) -> (min_delegated, anchor))
+    (obj2 (req "amount" Tez.encoding) (opt "level" Level_repr.encoding))
+
 type info = {
   full_balance : Tez.t;
   current_frozen_deposits : Tez.t;
@@ -116,10 +123,12 @@ type info = {
   frozen_deposits_limit : Tez.t option;
   delegated_contracts : Contract.t list;
   delegated_balance : Tez.t;
+  min_delegated_in_current_cycle : Tez.t * Level_repr.t option;
   total_delegated_stake : Tez.t;
   staking_denominator : Staking_pseudotoken.t;
   deactivated : bool;
   grace_period : Cycle.t;
+  pending_denunciations : bool;
   voting_info : Vote.delegate_info;
   active_consensus_key : Signature.Public_key_hash.t;
   pending_consensus_keys : (Cycle.t * Signature.Public_key_hash.t) list;
@@ -136,10 +145,12 @@ let info_encoding =
            frozen_deposits_limit;
            delegated_contracts;
            delegated_balance;
+           min_delegated_in_current_cycle;
            total_delegated_stake;
            staking_denominator;
            deactivated;
            grace_period;
+           pending_denunciations;
            voting_info;
            active_consensus_key;
            pending_consensus_keys;
@@ -151,9 +162,10 @@ let info_encoding =
           frozen_deposits_limit,
           delegated_contracts,
           delegated_balance,
+          min_delegated_in_current_cycle,
           deactivated,
           grace_period ),
-        ( (total_delegated_stake, staking_denominator),
+        ( (pending_denunciations, total_delegated_stake, staking_denominator),
           (voting_info, (active_consensus_key, pending_consensus_keys)) ) ))
     (fun ( ( full_balance,
              current_frozen_deposits,
@@ -162,9 +174,10 @@ let info_encoding =
              frozen_deposits_limit,
              delegated_contracts,
              delegated_balance,
+             min_delegated_in_current_cycle,
              deactivated,
              grace_period ),
-           ( (total_delegated_stake, staking_denominator),
+           ( (pending_denunciations, total_delegated_stake, staking_denominator),
              (voting_info, (active_consensus_key, pending_consensus_keys)) ) ) ->
       {
         full_balance;
@@ -174,16 +187,18 @@ let info_encoding =
         frozen_deposits_limit;
         delegated_contracts;
         delegated_balance;
+        min_delegated_in_current_cycle;
         total_delegated_stake;
         staking_denominator;
         deactivated;
         grace_period;
+        pending_denunciations;
         voting_info;
         active_consensus_key;
         pending_consensus_keys;
       })
     (merge_objs
-       (obj9
+       (obj10
           (req "full_balance" Tez.encoding)
           (req "current_frozen_deposits" Tez.encoding)
           (req "frozen_deposits" Tez.encoding)
@@ -191,10 +206,14 @@ let info_encoding =
           (opt "frozen_deposits_limit" Tez.encoding)
           (req "delegated_contracts" (list Contract.encoding))
           (req "delegated_balance" Tez.encoding)
+          (req
+             "min_delegated_in_current_cycle"
+             min_delegated_in_current_cycle_encoding)
           (req "deactivated" bool)
           (req "grace_period" Cycle.encoding))
        (merge_objs
-          (obj2
+          (obj3
+             (req "pending_denunciations" bool)
              (req "total_delegated_stake" Tez.encoding)
              (req "staking_denominator" Staking_pseudotoken.For_RPC.encoding))
           (merge_objs
@@ -334,9 +353,8 @@ module S = struct
   let frozen_deposits =
     RPC_service.get_service
       ~description:
-        "Returns the amount of the frozen deposits (in mutez) at the beginning \
-         of the current cycle. It doesn't count frozen deposits unstaked \
-         before the current cycle."
+        "Returns the amount (in mutez) frozen as a deposit at the time the \
+         staking rights for the current cycle where computed."
       ~query:RPC_query.empty
       ~output:Tez.encoding
       RPC_path.(path / "frozen_deposits")
@@ -406,6 +424,16 @@ module S = struct
       ~output:Tez.encoding
       RPC_path.(path / "delegated_balance")
 
+  let min_delegated_in_current_cycle =
+    RPC_service.get_service
+      ~description:
+        "Returns the minimum of delegated tez (in mutez) over the current \
+         cycle and the block level where this value was last updated (* Level \
+         is `None` when decoding values from protocol O)."
+      ~query:RPC_query.empty
+      ~output:min_delegated_in_current_cycle_encoding
+      RPC_path.(path / "min_delegated_in_current_cycle")
+
   let deactivated =
     RPC_service.get_service
       ~description:
@@ -447,8 +475,8 @@ module S = struct
       ~description:
         "The baking power of a delegate, as computed from its current stake. \
          This value is not used for computing baking rights but only reflects \
-         the baking power that the delegate would have if a snapshot was taken \
-         at the current block."
+         the baking power that the delegate would have if the cycle ended at \
+         the current block."
       ~query:RPC_query.empty
       ~output:Data_encoding.int64
       RPC_path.(path / "current_baking_power")
@@ -511,6 +539,22 @@ module S = struct
       ~query:RPC_query.empty
       ~output:(list pending_staking_parameters_encoding)
       RPC_path.(path / "pending_staking_parameters")
+
+  let pending_denunciations =
+    RPC_service.get_service
+      ~description:"Returns the pending denunciations for the given delegate."
+      ~query:RPC_query.empty
+      ~output:(list Denunciations_repr.item_encoding)
+      RPC_path.(path / "denunciations")
+
+  let estimated_shared_pending_slashed_amount =
+    RPC_service.get_service
+      ~description:
+        "Returns the estimated shared pending slashed amount (in mutez) of a \
+         given delegate."
+      ~query:RPC_query.empty
+      ~output:Tez.encoding
+      RPC_path.(path / "estimated_shared_pending_slashed_amount")
 end
 
 let check_delegate_registered ctxt pkh =
@@ -572,6 +616,9 @@ let register () =
       let* frozen_deposits_limit = Delegate.frozen_deposits_limit ctxt pkh in
       let*! delegated_contracts = Delegate.delegated_contracts ctxt pkh in
       let* delegated_balance = Delegate.For_RPC.delegated_balance ctxt pkh in
+      let* min_delegated_in_current_cycle =
+        Delegate.For_RPC.min_delegated_in_current_cycle ctxt pkh
+      in
       let* total_delegated_stake =
         Staking_pseudotokens.For_RPC.get_frozen_deposits_staked_tez
           ctxt
@@ -584,6 +631,9 @@ let register () =
       in
       let* deactivated = Delegate.deactivated ctxt pkh in
       let* grace_period = Delegate.last_cycle_before_deactivation ctxt pkh in
+      let*! pending_denunciations =
+        Delegate.For_RPC.has_pending_denunciations ctxt pkh
+      in
       let* voting_info = Vote.get_delegate_info ctxt pkh in
       let* consensus_key = Delegate.Consensus_key.active_pubkey ctxt pkh in
       let+ pendings = Delegate.Consensus_key.pending_updates ctxt pkh in
@@ -598,10 +648,12 @@ let register () =
         frozen_deposits_limit;
         delegated_contracts;
         delegated_balance;
+        min_delegated_in_current_cycle;
         total_delegated_stake;
         staking_denominator;
         deactivated;
         grace_period;
+        pending_denunciations;
         voting_info;
         active_consensus_key = consensus_key.consensus_pkh;
         pending_consensus_keys;
@@ -622,12 +674,12 @@ let register () =
   register1 ~chunked:false S.unstaked_frozen_deposits (fun ctxt pkh () () ->
       let* () = check_delegate_registered ctxt pkh in
       let ctxt_cycle = (Alpha_context.Level.current ctxt).cycle in
-      let csts = (Constants.all ctxt).parametric in
       let last_unslashable_cycle =
         Option.value ~default:Cycle.root
         @@ Cycle.sub
              ctxt_cycle
-             (csts.preserved_cycles + Constants_repr.max_slashing_period)
+             (Constants.slashable_deposits_period ctxt
+             + Constants_repr.max_slashing_period)
       in
       let cycles = Cycle.(last_unslashable_cycle ---> ctxt_cycle) in
       let* requests =
@@ -660,6 +712,12 @@ let register () =
   register1 ~chunked:false S.delegated_balance (fun ctxt pkh () () ->
       let* () = check_delegate_registered ctxt pkh in
       Delegate.For_RPC.delegated_balance ctxt pkh) ;
+  register1
+    ~chunked:false
+    S.min_delegated_in_current_cycle
+    (fun ctxt pkh () () ->
+      let* () = check_delegate_registered ctxt pkh in
+      Delegate.For_RPC.min_delegated_in_current_cycle ctxt pkh) ;
   register1 ~chunked:false S.total_delegated_stake (fun ctxt pkh () () ->
       let* () = check_delegate_registered ctxt pkh in
       Staking_pseudotokens.For_RPC.get_frozen_deposits_staked_tez
@@ -710,7 +768,15 @@ let register () =
   register1 ~chunked:false S.active_staking_parameters (fun ctxt pkh () () ->
       Delegate.Staking_parameters.of_delegate ctxt pkh) ;
   register1 ~chunked:false S.pending_staking_parameters (fun ctxt pkh () () ->
-      Delegate.Staking_parameters.pending_updates ctxt pkh)
+      Delegate.Staking_parameters.pending_updates ctxt pkh) ;
+  register1 ~chunked:false S.pending_denunciations (fun ctxt pkh () () ->
+      Delegate.For_RPC.pending_denunciations ctxt pkh) ;
+  register1
+    ~chunked:false
+    S.estimated_shared_pending_slashed_amount
+    (fun ctxt delegate () () ->
+      let* () = check_delegate_registered ctxt delegate in
+      Delegate.For_RPC.get_estimated_shared_pending_slashed_amount ctxt delegate)
 
 let list ctxt block ?(active = true) ?(inactive = false)
     ?(with_minimal_stake = true) ?(without_minimal_stake = false) () =
@@ -782,3 +848,15 @@ let active_staking_parameters ctxt block pkh =
 
 let pending_staking_parameters ctxt block pkh =
   RPC_context.make_call1 S.pending_staking_parameters ctxt block pkh () ()
+
+let pending_denunciations ctxt block pkh =
+  RPC_context.make_call1 S.pending_denunciations ctxt block pkh () ()
+
+let estimated_shared_pending_slashed_amount ctxt block pkh =
+  RPC_context.make_call1
+    S.estimated_shared_pending_slashed_amount
+    ctxt
+    block
+    pkh
+    ()
+    ()

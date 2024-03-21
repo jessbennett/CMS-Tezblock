@@ -4,7 +4,7 @@
 (* Copyright (c) 2023 Nomadic Labs <contact@nomadic-labs.com>                *)
 (* Copyright (c) 2023-2024 TriliTech <contact@trili.tech>                    *)
 (* Copyright (c) 2023 Marigold <contact@marigold.dev>                        *)
-(* Copyright (c) 2023 Functori <contact@functori.com>                        *)
+(* Copyright (c) 2023-2024 Functori <contact@functori.com>                   *)
 (*                                                                           *)
 (*****************************************************************************)
 
@@ -22,9 +22,16 @@ open Contract_path
 
 let pvm_kind = "wasm_2_0_0"
 
-let kernel_inputs_path = "etherlink/tezt/tests/evm_kernel_inputs"
+let base_fee_for_hardcoded_tx = Wei.to_wei_z @@ Z.of_int 21000
 
-type l1_contracts = {exchanger : string; bridge : string; admin : string}
+type l1_contracts = {
+  exchanger : string;
+  bridge : string;
+  admin : string;
+  kernel_governance : string;
+  kernel_security_governance : string;
+  sequencer_governance : string option;
+}
 
 type full_evm_setup = {
   node : Node.t;
@@ -41,6 +48,8 @@ type full_evm_setup = {
     | `Path of string
     | `Both of Installer_kernel_config.instr list * string ]
     option;
+  kernel : string;
+  kernel_root_hash : string;
 }
 
 let hex_256_of n = Printf.sprintf "%064x" n
@@ -55,8 +64,8 @@ let hex_256_of_address acc =
 
 let expected_gas_fees ~gas_price ~gas_used =
   let open Wei in
-  let gas_price = gas_price |> Z.of_int32 |> Wei.to_wei_z in
-  let gas_used = gas_used |> Z.of_int32 in
+  let gas_price = gas_price |> Z.of_int64 |> Wei.to_wei_z in
+  let gas_used = gas_used |> Z.of_int64 in
   gas_price * gas_used
 
 let evm_node_version evm_node =
@@ -77,25 +86,49 @@ let check_tx_succeeded ~endpoint ~tx =
   unit
 
 let check_tx_failed ~endpoint ~tx =
-  let* status = get_transaction_status ~endpoint ~tx in
-  Check.(is_false status) ~error_msg:"Expected transaction to fail." ;
-  unit
+  (* Eth-cli sometimes wraps receipt of failed transaction in its own error
+     message. This means that the [tx] could be an empty string.
+     Additionally, the output of eth-cli might contain some extra characters,
+     so we use a regular expression to make sure we get a valid hash.
+  *)
+  let tx = tx =~* rex "(0x[0-9a-fA-F]{64})" in
+  match tx with
+  | Some tx ->
+      let* status = get_transaction_status ~endpoint ~tx in
+      Check.(is_false status) ~error_msg:"Expected transaction to fail." ;
+      unit
+  | None -> unit
 
-(* Check simple transfer base fee is correct
+(* Check simple transfer fee is correct
 
-   We apply a flat base fee to every tx - which is paid through an
-   increase in estimate gas used at the given price.
+   We apply a da_fee to every tx - which is paid through an
+   increase in in either/both gas_used, gas_price.
+
+   We prefer to keep [gas_used == execution_gas_used] where possible, but
+   when this results in [gas_price > tx.max_price_per_gas], we set gas_price to
+   tx.max_price_per_gas, and increase the gas_used in the receipt.
 *)
-let check_tx_gas_for_flat_fee ~flat_fee ~gas_price ~gas_used =
-  let expected_gas_used = 21000l in
-  let gas_for_flat_fee = Z.of_int32 (Int32.sub gas_used expected_gas_used) in
-  let gas_price = gas_price |> Z.of_int32 in
-  (* integer division truncates - so we make sure to take ceil(a/b) not floor(a/b).
-     otherwise we'd end up with very slightly less gas than needed to cover the
-     flat fee. *)
-  let actual_gas_for_flat_fee = Wei.cdiv flat_fee gas_price in
-  Check.((actual_gas_for_flat_fee = Wei.to_wei_z gas_for_flat_fee) Wei.typ)
-    ~error_msg:"Unexpected flat fee"
+let check_tx_gas_for_fee ~da_fee_per_byte ~expected_execution_gas ~gas_price
+    ~gas_used ~base_fee_per_gas ~data_size =
+  (* execution gas fee *)
+  let expected_execution_gas = Z.of_int expected_execution_gas in
+  let expected_base_fee_per_gas = Z.of_int32 base_fee_per_gas in
+  let execution_gas_fee =
+    Z.mul expected_execution_gas expected_base_fee_per_gas
+  in
+  (* Data availability fee *)
+  let assumed_encoded_size = 150 in
+  let size = Z.of_int (assumed_encoded_size + data_size) in
+  let da_fee = Wei.(da_fee_per_byte * size) in
+  (* total fee 'in gas' *)
+  let expected_total_fee =
+    Z.add (Wei.of_wei_z da_fee) execution_gas_fee |> Z.to_int64
+  in
+  let total_fee_receipt =
+    Z.(mul (of_int64 gas_price) (of_int64 gas_used)) |> Z.to_int64
+  in
+  Check.((total_fee_receipt >= expected_total_fee) int64)
+    ~error_msg:"total fee in receipt %L did not cover expected fees of %R"
 
 let check_status_n_logs ~endpoint ~status ~logs ~tx =
   let* receipt = Eth_cli.get_receipt ~endpoint ~tx in
@@ -177,33 +210,27 @@ let wait_for_transaction_receipt ?(count = 3) ~evm_node ~transaction_hash () =
   in
   loop count
 
-let wait_for_application ~evm_node ~sc_rollup_node ~node ~client apply () =
-  let* start_level = Client.level client in
+let wait_for_application ~evm_node ~sc_rollup_node ~client apply =
   let max_iteration = 10 in
   let application_result = apply () in
-  let rec loop () =
+  let rec loop current_iteration =
     let* () = Lwt_unix.sleep 5. in
-    let* new_level =
-      match Evm_node.mode evm_node with
-      | Proxy _ -> next_evm_level ~evm_node ~sc_rollup_node ~node ~client
-      | Sequencer _ ->
-          let*@ head = Rpc.block_number evm_node in
-          return (Int32.to_int head)
-    in
-    if start_level + max_iteration < new_level then
+    let* () = Helpers.next_evm_level ~evm_node ~sc_rollup_node ~client in
+    if max_iteration < current_iteration then
       Test.fail
         "Baked more than %d blocks and the operation's application is still \
          pending"
         max_iteration ;
-    if Lwt.state application_result = Lwt.Sleep then loop () else unit
+    if Lwt.state application_result = Lwt.Sleep then loop (current_iteration + 1)
+    else unit
   in
   (* Using [Lwt.both] ensures that any exception thrown in [tx_hash] will be
      thrown by [Lwt.both] as well. *)
-  let* result, () = Lwt.both application_result (loop ()) in
+  let* result, () = Lwt.both application_result (loop 0) in
   return result
 
 (* sending more than ~300 tx could fail, because or curl *)
-let send_n_transactions ~sc_rollup_node ~node ~client ~evm_node txs =
+let send_n_transactions ~sc_rollup_node ~client ~evm_node ?wait_for_blocks txs =
   let requests =
     List.map
       (fun tx ->
@@ -223,14 +250,15 @@ let send_n_transactions ~sc_rollup_node ~node ~client ~evm_node txs =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
-      (wait_for_transaction_receipt ~evm_node ~transaction_hash:first_hash)
-      ()
+      (wait_for_transaction_receipt
+         ?count:wait_for_blocks
+         ~evm_node
+         ~transaction_hash:first_hash)
   in
   return (requests, receipt, hashes)
 
-let setup_l1_contracts ~admin client =
+let setup_l1_contracts ~admin ?sequencer_admin client =
   (* Originates the exchanger. *)
   let* exchanger =
     Client.originate_contract
@@ -257,8 +285,27 @@ let setup_l1_contracts ~admin client =
   in
   let* () = Client.bake_for_and_wait ~keys:[] client in
 
+  (* Originates the sequencer administrator contract. *)
+  let* sequencer_governance =
+    match sequencer_admin with
+    | Some sequencer_admin ->
+        let* sequencer_admin =
+          Client.originate_contract
+            ~alias:"evm-sequencer-admin"
+            ~amount:Tez.zero
+            ~src:Constant.bootstrap1.public_key_hash
+            ~init:(sf "%S" sequencer_admin.Account.public_key_hash)
+            ~prg:(admin_path ())
+            ~burn_cap:Tez.one
+            client
+        in
+        let* () = Client.bake_for_and_wait ~keys:[] client in
+        return (Some sequencer_admin)
+    | None -> return None
+  in
+
   (* Originates the administrator contract. *)
-  let* admin =
+  let* admin_contract =
     Client.originate_contract
       ~alias:"evm-admin"
       ~amount:Tez.zero
@@ -270,21 +317,58 @@ let setup_l1_contracts ~admin client =
   in
   let* () = Client.bake_for_and_wait ~keys:[] client in
 
-  return {exchanger; bridge; admin}
+  (* Originates the governance contract (using the administrator contract). *)
+  let* kernel_governance =
+    Client.originate_contract
+      ~alias:"kernel-governance"
+      ~amount:Tez.zero
+      ~src:Constant.bootstrap1.public_key_hash
+      ~init:(sf "%S" admin.Account.public_key_hash)
+      ~prg:(admin_path ())
+      ~burn_cap:Tez.one
+      client
+  in
+  let* () = Client.bake_for_and_wait ~keys:[] client in
+
+  (* Originates the governance contract (using the administrator contract). *)
+  let* kernel_security_governance =
+    Client.originate_contract
+      ~alias:"security-governance"
+      ~amount:Tez.zero
+      ~src:Constant.bootstrap1.public_key_hash
+      ~init:(sf "%S" admin.Account.public_key_hash)
+      ~prg:(admin_path ())
+      ~burn_cap:Tez.one
+      client
+  in
+  let* () = Client.bake_for_and_wait ~keys:[] client in
+
+  return
+    {
+      exchanger;
+      bridge;
+      admin = admin_contract;
+      kernel_governance;
+      sequencer_governance;
+      kernel_security_governance;
+    }
 
 type setup_mode =
   | Setup_sequencer of {
       time_between_blocks : Evm_node.time_between_blocks option;
       sequencer : Account.key;
+      devmode : bool;
     }
   | Setup_proxy of {devmode : bool}
 
-let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
+let setup_evm_kernel ?(setup_kernel_root_hash = true) ?config
+    ?(kernel_installee = Constant.WASM.evm_kernel)
     ?(originator_key = Constant.bootstrap1.public_key_hash)
     ?(rollup_operator_key = Constant.bootstrap1.public_key_hash)
     ?(bootstrap_accounts = Eth_account.bootstrap_accounts)
-    ?(with_administrator = true) ?flat_fee ~admin ?commitment_period
-    ?challenge_window ?timestamp ?(setup_mode = Setup_proxy {devmode = true})
+    ?(with_administrator = true) ?da_fee_per_byte ?minimum_base_fee_per_gas
+    ~admin ?sequencer_admin ?commitment_period ?challenge_window ?timestamp
+    ?(setup_mode = Setup_proxy {devmode = true}) ?(force_install_kernel = true)
     protocol =
   let* node, client =
     setup_l1 ?commitment_period ?challenge_window ?timestamp protocol
@@ -292,9 +376,19 @@ let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
   let* l1_contracts =
     match admin with
     | Some admin ->
-        let* res = setup_l1_contracts ~admin client in
+        let* res = setup_l1_contracts ~admin ?sequencer_admin client in
         return (Some res)
     | None -> return None
+  in
+  let* kernel_root_hash =
+    if setup_kernel_root_hash then
+      let* {root_hash; _} =
+        prepare_installer_kernel
+          ~preimages_dir:(Temp.dir "ignored_preimages")
+          kernel_installee
+      in
+      return (Some root_hash)
+    else return None
   in
   (* If a L1 bridge was set up, we make the kernel aware of the address. *)
   let base_config =
@@ -304,17 +398,32 @@ let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
         Option.map (fun {admin; _} -> admin) l1_contracts
       else None
     in
+    let kernel_governance =
+      Option.map (fun {kernel_governance; _} -> kernel_governance) l1_contracts
+    in
+    let kernel_security_governance =
+      Option.map
+        (fun {kernel_security_governance; _} -> kernel_security_governance)
+        l1_contracts
+    in
     let sequencer =
       match setup_mode with
       | Setup_proxy _ -> None
       | Setup_sequencer {sequencer; _} -> Some sequencer.public_key
     in
     Configuration.make_config
+      ?kernel_root_hash
       ~bootstrap_accounts
-      ?flat_fee
+      ?da_fee_per_byte
+      ?minimum_base_fee_per_gas
       ?ticketer
       ?administrator
+      ?kernel_governance
+      ?kernel_security_governance
       ?sequencer
+      ?sequencer_governance:
+        (Option.bind l1_contracts (fun {sequencer_governance; _} ->
+             sequencer_governance))
       ()
   in
   let config =
@@ -337,7 +446,7 @@ let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
   let preimages_dir =
     Filename.concat (Sc_rollup_node.data_dir sc_rollup_node) "wasm_2_0_0"
   in
-  let* {output; _} =
+  let* {output; root_hash; _} =
     prepare_installer_kernel ~preimages_dir ?config kernel_installee
   in
   let* sc_rollup_address =
@@ -353,20 +462,21 @@ let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
     Sc_rollup_node.run sc_rollup_node sc_rollup_address [Log_kernel_debug]
   in
   (* EVM Kernel installation level. *)
-  let* () = Client.bake_for_and_wait ~keys:[] client in
-  let* level = Node.get_level node in
-  let* _ = Sc_rollup_node.wait_for_level ~timeout:30. sc_rollup_node level in
+  let* () =
+    if force_install_kernel then
+      let* () = Client.bake_for_and_wait ~keys:[] client in
+      let* level = Node.get_level node in
+      let* _ =
+        Sc_rollup_node.wait_for_level ~timeout:30. sc_rollup_node level
+      in
+      unit
+    else unit
+  in
   let* mode =
     match setup_mode with
     | Setup_proxy {devmode} -> return (Evm_node.Proxy {devmode})
-    | Setup_sequencer {time_between_blocks; sequencer} ->
-        let private_rpc_port = Port.fresh () in
-        let sequencer =
-          match sequencer.secret_key with
-          | Unencrypted sk -> sk
-          | Encrypted _ ->
-              Test.fail "Provide an unencrypted key for the sequencer"
-        in
+    | Setup_sequencer {time_between_blocks; sequencer; devmode} ->
+        let private_rpc_port = Some (Port.fresh ()) in
         return
           (Evm_node.Sequencer
              {
@@ -374,7 +484,14 @@ let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
                preimage_dir = preimages_dir;
                private_rpc_port;
                time_between_blocks;
-               sequencer;
+               sequencer = sequencer.alias;
+               genesis_timestamp = None;
+               max_blueprints_lag = None;
+               max_blueprints_ahead = None;
+               max_blueprints_catchup = None;
+               catchup_cooldown = None;
+               devmode;
+               wallet_dir = Some (Client.base_dir client);
              })
   in
   let* evm_node =
@@ -393,10 +510,13 @@ let setup_evm_kernel ?config ?(kernel_installee = Constant.WASM.evm_kernel)
       endpoint;
       l1_contracts;
       config;
+      kernel = output;
+      kernel_root_hash = root_hash;
     }
 
 let register_test ?config ~title ~tags ?(admin = None) ?uses ?commitment_period
-    ?challenge_window ?bootstrap_accounts ?flat_fee ~setup_mode f =
+    ?challenge_window ?bootstrap_accounts ?da_fee_per_byte
+    ?minimum_base_fee_per_gas ~setup_mode f =
   let extra_tag =
     match setup_mode with
     | Setup_proxy _ -> "proxy"
@@ -425,7 +545,8 @@ let register_test ?config ~title ~tags ?(admin = None) ?uses ?commitment_period
           ?commitment_period
           ?challenge_window
           ?bootstrap_accounts
-          ?flat_fee
+          ?da_fee_per_byte
+          ?minimum_base_fee_per_gas
           ~admin
           ~setup_mode
           protocol
@@ -433,7 +554,8 @@ let register_test ?config ~title ~tags ?(admin = None) ?uses ?commitment_period
       f ~protocol ~evm_setup)
 
 let register_proxy ?config ~title ~tags ?uses ?admin ?commitment_period
-    ?challenge_window ?bootstrap_accounts f protocols =
+    ?challenge_window ?bootstrap_accounts ?minimum_base_fee_per_gas f protocols
+    =
   register_test
     ?config
     ~title
@@ -443,12 +565,14 @@ let register_proxy ?config ~title ~tags ?uses ?admin ?commitment_period
     ?commitment_period
     ?challenge_window
     ?bootstrap_accounts
+    ?minimum_base_fee_per_gas
     f
     protocols
     ~setup_mode:(Setup_proxy {devmode = true})
 
 let register_both ~title ~tags ?uses ?admin ?commitment_period ?challenge_window
-    ?bootstrap_accounts ?flat_fee ?config ?time_between_blocks f protocols =
+    ?bootstrap_accounts ?da_fee_per_byte ?minimum_base_fee_per_gas ?config
+    ?time_between_blocks f protocols =
   let register =
     register_test
       ?config
@@ -459,19 +583,21 @@ let register_both ~title ~tags ?uses ?admin ?commitment_period ?challenge_window
       ?commitment_period
       ?challenge_window
       ?bootstrap_accounts
-      ?flat_fee
+      ?da_fee_per_byte
+      ?minimum_base_fee_per_gas
       f
       protocols
   in
   register ~setup_mode:(Setup_proxy {devmode = true}) ;
   register
     ~setup_mode:
-      (Setup_sequencer {time_between_blocks; sequencer = Constant.bootstrap1})
+      (Setup_sequencer
+         {time_between_blocks; sequencer = Constant.bootstrap1; devmode = true})
 
 type contract = {label : string; abi : string; bin : string}
 
 let deploy ~contract ~sender full_evm_setup =
-  let {node; client; sc_rollup_node; evm_node; _} = full_evm_setup in
+  let {client; sc_rollup_node; evm_node; _} = full_evm_setup in
   let evm_node_endpoint = Evm_node.endpoint evm_node in
   let* () = Eth_cli.add_abi ~label:contract.label ~abi:contract.abi () in
   let send_deploy () =
@@ -481,7 +607,7 @@ let deploy ~contract ~sender full_evm_setup =
       ~abi:contract.label
       ~bin:contract.bin
   in
-  wait_for_application ~evm_node ~sc_rollup_node ~node ~client send_deploy ()
+  wait_for_application ~evm_node ~sc_rollup_node ~client send_deploy
 
 type deploy_checks = {
   contract : contract;
@@ -529,13 +655,13 @@ let deploy_with_base_checks {contract; expected_address; expected_code}
   Check.(
     list_mem
       string
-      (Helpers.normalize contract_address)
+      (Durable_storage_path.normalize contract_address)
       (List.map String.lowercase_ascii accounts)
       ~error_msg:"Expected %L account to be initialized by contract creation.") ;
   unit
 
 let send ~sender ~receiver ~value ?data full_evm_setup =
-  let {node; client; sc_rollup_node; evm_node; _} = full_evm_setup in
+  let {client; sc_rollup_node; evm_node; _} = full_evm_setup in
   let evm_node_endpoint = Evm_node.endpoint evm_node in
   let send =
     Eth_cli.transaction_send
@@ -545,11 +671,11 @@ let send ~sender ~receiver ~value ?data full_evm_setup =
       ~endpoint:evm_node_endpoint
       ?data
   in
-  wait_for_application ~evm_node ~sc_rollup_node ~node ~client send ()
+  wait_for_application ~evm_node ~sc_rollup_node ~client send
 
-let check_block_progression ~evm_node ~sc_rollup_node ~node ~client ~endpoint
+let check_block_progression ~evm_node ~sc_rollup_node ~client ~endpoint
     ~expected_block_level =
-  let* _level = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _level = next_evm_level ~evm_node ~sc_rollup_node ~client in
   let* block_number = Eth_cli.block_number ~endpoint in
   return
   @@ Check.((block_number = expected_block_level) int)
@@ -623,7 +749,9 @@ let test_originate_evm_kernel =
   unit
 
 let test_rpc_getBalance =
-  register_both ~tags:["evm"; "get_balance"] ~title:"RPC method eth_getBalance"
+  register_both
+    ~tags:["evm"; "rpc"; "get_balance"]
+    ~title:"RPC method eth_getBalance"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   let evm_node_endpoint = Evm_node.endpoint evm_node in
   let* balance =
@@ -640,7 +768,7 @@ let test_rpc_getBalance =
 
 let test_rpc_getBlockByNumber =
   register_both
-    ~tags:["evm"; "get_block_by_number"]
+    ~tags:["evm"; "rpc"; "get_block_by_number"]
     ~title:"RPC method eth_getBlockByNumber"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   let evm_node_endpoint = Evm_node.endpoint evm_node in
@@ -663,14 +791,14 @@ let get_block_by_hash ?(full_tx_objects = false) evm_setup block_hash =
 
 let test_rpc_getBlockByHash =
   register_both
-    ~tags:["evm"; "get_block_by_hash"]
+    ~tags:["evm"; "rpc"; "get_block_by_hash"]
     ~title:"RPC method eth_getBlockByHash"
   @@ fun ~protocol:_ ~evm_setup ->
   let evm_node_endpoint = Evm_node.endpoint evm_setup.evm_node in
   let* block = Eth_cli.get_block ~block_id:"0" ~endpoint:evm_node_endpoint in
   Check.((block.number = 0l) int32)
     ~error_msg:"Unexpected block number, should be %%R, but got %%L" ;
-  let* block' = get_block_by_hash evm_setup (Option.get block.hash) in
+  let* block' = get_block_by_hash evm_setup block.hash in
   assert (block = block') ;
   unit
 
@@ -685,44 +813,62 @@ let test_l2_block_size_non_zero =
     ~error_msg:"Unexpected block size, should be > 0, but got %%L" ;
   unit
 
-let transaction_count_request address =
-  Evm_node.
-    {
-      method_ = "eth_getTransactionCount";
-      parameters = `A [`String address; `String "latest"];
-    }
-
-let get_transaction_count evm_node address =
-  let* transaction_count =
-    Evm_node.call_evm_rpc evm_node (transaction_count_request address)
-  in
-  return JSON.(transaction_count |-> "result" |> as_int64)
-
 let test_rpc_getTransactionCount =
   register_both
-    ~tags:["evm"; "get_transaction_count"]
+    ~tags:["evm"; "rpc"; "get_transaction_count"]
     ~title:"RPC method eth_getTransactionCount"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
-  let* transaction_count =
-    get_transaction_count evm_node Eth_account.bootstrap_accounts.(0).address
+  let*@ transaction_count =
+    Rpc.get_transaction_count
+      evm_node
+      ~address:Eth_account.bootstrap_accounts.(0).address
   in
   Check.((transaction_count = 0L) int64)
     ~error_msg:"Expected a nonce of %R, but got %L" ;
   unit
 
+let test_rpc_blockNumber =
+  register_both
+    ~tags:["evm"; "rpc"; "block_number"]
+    ~title:"RPC method eth_blockNumber"
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
+  let* () =
+    repeat 2 (fun () -> next_evm_level ~evm_node ~sc_rollup_node ~client)
+  in
+  let*@ block_number = Rpc.block_number evm_node in
+  Check.((block_number = 2l) int32)
+    ~error_msg:"Expected a block number of %R, but got %L" ;
+  unit
+
+let test_rpc_net_version =
+  register_both
+    ~tags:["evm"; "rpc"; "net_version"]
+    ~title:"RPC method net_version"
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
+  let*@ net_version = Rpc.net_version evm_node in
+  Check.((net_version = "1337") string)
+    ~error_msg:"Expected net_version is %R, but got %L" ;
+  unit
+
 let test_rpc_getTransactionCountBatch =
   register_both
-    ~tags:["evm"; "get_transaction_count_as_batch"]
+    ~tags:["evm"; "rpc"; "get_transaction_count_as_batch"]
     ~title:"RPC method eth_getTransactionCount in batch"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
-  let* transaction_count =
-    get_transaction_count evm_node Eth_account.bootstrap_accounts.(0).address
+  let*@ transaction_count =
+    Rpc.get_transaction_count
+      evm_node
+      ~address:Eth_account.bootstrap_accounts.(0).address
   in
   let* transaction_count_batch =
     let* transaction_count =
       Evm_node.batch_evm_rpc
         evm_node
-        [transaction_count_request Eth_account.bootstrap_accounts.(0).address]
+        [
+          Rpc.Request.eth_getTransactionCount
+            ~address:Eth_account.bootstrap_accounts.(0).address
+            ~block:"latest";
+        ]
     in
     match JSON.as_list transaction_count with
     | [transaction_count] ->
@@ -738,7 +884,9 @@ let test_rpc_batch =
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   let* transaction_count, chain_id =
     let transaction_count =
-      transaction_count_request Eth_account.bootstrap_accounts.(0).address
+      Rpc.Request.eth_getTransactionCount
+        ~address:Eth_account.bootstrap_accounts.(0).address
+        ~block:"latest"
     in
     let chain_id = Evm_node.{method_ = "eth_chainId"; parameters = `Null} in
     let* results =
@@ -763,13 +911,12 @@ let test_l2_blocks_progression =
   register_proxy
     ~tags:["evm"; "l2_blocks_progression"]
     ~title:"Check L2 blocks progression"
-  @@ fun ~protocol:_
-             ~evm_setup:{node; client; sc_rollup_node; endpoint; evm_node; _} ->
+  @@ fun ~protocol:_ ~evm_setup:{client; sc_rollup_node; endpoint; evm_node; _}
+    ->
   let* () =
     check_block_progression
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       ~endpoint
       ~expected_block_level:1
@@ -778,7 +925,6 @@ let test_l2_blocks_progression =
     check_block_progression
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       ~endpoint
       ~expected_block_level:2
@@ -798,11 +944,11 @@ let test_consistent_block_hashes =
       ])
     ~title:"Check L2 blocks consistency of hashes"
   @@ fun protocol ->
-  let* {node; client; sc_rollup_node; endpoint; evm_node; _} =
+  let* {client; sc_rollup_node; endpoint; evm_node; _} =
     setup_evm_kernel ~admin:None protocol
   in
   let new_block () =
-    let* _level = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+    let* _level = next_evm_level ~evm_node ~sc_rollup_node ~client in
     let* number = Eth_cli.block_number ~endpoint in
     Eth_cli.get_block ~block_id:(string_of_int number) ~endpoint
   in
@@ -814,8 +960,7 @@ let test_consistent_block_hashes =
   let* block4 = new_block () in
 
   let check_parent_hash parent block =
-    let parent_hash = Option.value ~default:"" parent.Block.hash in
-    Check.((block.Block.parent = parent_hash) string)
+    Check.((block.Block.parent = parent.Block.hash) string)
       ~error_msg:"Unexpected parent hash, should be %%R, but got %%L"
   in
 
@@ -968,6 +1113,60 @@ let block_hash_gen =
     bin = kernel_inputs_path ^ "/block_hash_gen.bin";
   }
 
+(** The info for the "block_hash_gen.sol" contract.
+    See [etherlink/kernel_evm/solidity_examples/blockhash.sol] *)
+let blockhash =
+  {
+    label = "blockhash";
+    abi = kernel_inputs_path ^ "/blockhash.abi";
+    bin = kernel_inputs_path ^ "/blockhash.bin";
+  }
+
+(** The info for the "timestamp.sol" contract.
+    See [etherlink/kernel_evm/solidity_examples/timestamp.sol] *)
+let timestamp =
+  {
+    label = "timestamp";
+    abi = kernel_inputs_path ^ "/timestamp.abi";
+    bin = kernel_inputs_path ^ "/timestamp.bin";
+  }
+
+(** The info for the "call_selfdestruct.sol" contract.
+    See [etherlink/kernel_evm/solidity_examples/call_selfdestruct.sol] *)
+let call_selfdestruct =
+  {
+    label = "call_selfdestruct";
+    abi = kernel_inputs_path ^ "/call_selfdestruct.abi";
+    bin = kernel_inputs_path ^ "/call_selfdestruct.bin";
+  }
+
+(** The info for the "recursive.sol" contract.
+    See [etherlink/kernel_evm/solidity_examples/recursive.sol] *)
+let recursive =
+  {
+    label = "recursive";
+    abi = kernel_inputs_path ^ "/recursive.abi";
+    bin = kernel_inputs_path ^ "/recursive.bin";
+  }
+
+(** The info for the "error.sol" contract.
+    See [etherlink/kernel_evm/solidity_examples/error.sol] *)
+let error =
+  {
+    label = "error";
+    abi = kernel_inputs_path ^ "/error.abi";
+    bin = kernel_inputs_path ^ "/error.bin";
+  }
+
+(** The info for the "block_hash_gen.sol" contract.
+    See [etherlink/kernel_evm/solidity_examples/spam_withdrawal.sol] *)
+let spam_withdrawal =
+  {
+    label = "spam_withdrawal";
+    abi = kernel_inputs_path ^ "/spam_withdrawal.abi";
+    bin = kernel_inputs_path ^ "/spam_withdrawal.bin";
+  }
+
 (** Test that the contract creation works.  *)
 let test_l2_deploy_simple_storage =
   register_proxy
@@ -986,7 +1185,7 @@ let test_l2_deploy_simple_storage =
     evm_setup
 
 let send_call_set_storage_simple contract_address sender n
-    {sc_rollup_node; node; client; endpoint; evm_node; _} =
+    {sc_rollup_node; client; endpoint; evm_node; _} =
   let call_set (sender : Eth_account.t) n =
     Eth_cli.contract_send
       ~source_private_key:sender.private_key
@@ -995,13 +1194,7 @@ let send_call_set_storage_simple contract_address sender n
       ~address:contract_address
       ~method_call:(Printf.sprintf "set(%d)" n)
   in
-  wait_for_application
-    ~evm_node
-    ~sc_rollup_node
-    ~node
-    ~client
-    (call_set sender n)
-    ()
+  wait_for_application ~evm_node ~sc_rollup_node ~client (call_set sender n)
 
 (** Test that a contract can be called,
     and that the call can modify the storage.  *)
@@ -1062,7 +1255,7 @@ let test_l2_deploy_erc20 =
     ~title:"Check L2 erc20 contract deployment"
   @@ fun ~protocol:_ ~evm_setup ->
   (* setup *)
-  let {evm_node; node; client; sc_rollup_node; _} = evm_setup in
+  let {evm_node; client; sc_rollup_node; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let player = Eth_account.bootstrap_accounts.(1) in
@@ -1090,7 +1283,7 @@ let test_l2_deploy_erc20 =
   Check.(
     list_mem
       string
-      (Helpers.normalize address)
+      (Durable_storage_path.normalize address)
       (List.map String.lowercase_ascii accounts)
       ~error_msg:"Expected %L account to be initialized by contract creation.") ;
 
@@ -1136,13 +1329,7 @@ let test_l2_deploy_erc20 =
   in
   (* sender mints 42 *)
   let* tx =
-    wait_for_application
-      ~evm_node
-      ~sc_rollup_node
-      ~node
-      ~client
-      (call_mint sender 42)
-      ()
+    wait_for_application ~evm_node ~sc_rollup_node ~client (call_mint sender 42)
   in
   let* () =
     check_status_n_logs ~endpoint ~status:true ~logs:(mint_logs sender 42) ~tx
@@ -1156,10 +1343,8 @@ let test_l2_deploy_erc20 =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_mint player 100)
-      ()
   in
   let* () =
     check_status_n_logs ~endpoint ~status:true ~logs:(mint_logs player 100) ~tx
@@ -1172,22 +1357,14 @@ let test_l2_deploy_erc20 =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_burn ~expect_failure:true sender 100)
-      ()
   in
   let* () = check_nb_in_storage ~evm_setup ~address ~nth:0 ~expected:142 in
 
   (* sender tries to burn 42, should succeed *)
   let* tx =
-    wait_for_application
-      ~evm_node
-      ~sc_rollup_node
-      ~node
-      ~client
-      (call_burn sender 42)
-      ()
+    wait_for_application ~evm_node ~sc_rollup_node ~client (call_burn sender 42)
   in
   let* () =
     check_status_n_logs ~endpoint ~status:true ~logs:(burn_logs sender 42) ~tx
@@ -1238,7 +1415,7 @@ let test_log_index =
     ~title:"Check that log index is correctly computed"
   @@ fun ~protocol:_ ~evm_setup ->
   (* setup *)
-  let {evm_node; node; client; sc_rollup_node; _} = evm_setup in
+  let {evm_node; client; sc_rollup_node; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let _player = Eth_account.bootstrap_accounts.(1) in
@@ -1255,7 +1432,6 @@ let test_log_index =
   let* _requests, _receipt, hashes =
     send_n_transactions
       ~sc_rollup_node
-      ~node
       ~client
       ~evm_node
       [raw_emitBoth; raw_emitA]
@@ -1326,14 +1502,6 @@ let get_tx_object ~endpoint ~tx_hash =
   | Some tx_object -> return tx_object
   | None -> Test.fail "The transaction object of %s should be available" tx_hash
 
-let get_transaction_receipt ~full_evm_setup ~tx_hash =
-  let* json =
-    Evm_node.call_evm_rpc
-      full_evm_setup.evm_node
-      {method_ = "eth_getTransactionReceipt"; parameters = `A [`String tx_hash]}
-  in
-  return JSON.(json |-> "result" |> Transaction.transaction_receipt_of_json)
-
 let ensure_transfer_result_integrity ~transfer_result ~sender ~receiver
     full_evm_setup =
   let endpoint = Evm_node.endpoint full_evm_setup.evm_node in
@@ -1342,14 +1510,16 @@ let ensure_transfer_result_integrity ~transfer_result ~sender ~receiver
   assert (sender_balance = transfer_result.sender_balance_after) ;
   let* receiver_balance = balance receiver.Eth_account.address in
   assert (receiver_balance = transfer_result.receiver_balance_after) ;
-  let* sender_nonce =
-    get_transaction_count full_evm_setup.evm_node sender.address
+  let*@ sender_nonce =
+    Rpc.get_transaction_count full_evm_setup.evm_node ~address:sender.address
   in
   assert (sender_nonce = transfer_result.sender_nonce_after) ;
   let* tx_object = get_tx_object ~endpoint ~tx_hash:transfer_result.tx_hash in
   assert (tx_object = transfer_result.tx_object) ;
-  let* tx_receipt =
-    get_transaction_receipt ~full_evm_setup ~tx_hash:transfer_result.tx_hash
+  let*@! tx_receipt =
+    Rpc.get_transaction_receipt
+      ~tx_hash:transfer_result.tx_hash
+      full_evm_setup.evm_node
   in
   assert (tx_receipt = transfer_result.tx_receipt) ;
   unit
@@ -1359,18 +1529,20 @@ let make_transfer ?data ~value ~sender ~receiver full_evm_setup =
   let balance account = Eth_cli.balance ~account ~endpoint in
   let* sender_balance_before = balance sender.Eth_account.address in
   let* receiver_balance_before = balance receiver.Eth_account.address in
-  let* sender_nonce_before =
-    get_transaction_count full_evm_setup.evm_node sender.address
+  let*@ sender_nonce_before =
+    Rpc.get_transaction_count full_evm_setup.evm_node ~address:sender.address
   in
   let* tx_hash = send ~sender ~receiver ~value ?data full_evm_setup in
   let* () = check_tx_succeeded ~endpoint ~tx:tx_hash in
   let* sender_balance_after = balance sender.address in
   let* receiver_balance_after = balance receiver.address in
-  let* sender_nonce_after =
-    get_transaction_count full_evm_setup.evm_node sender.address
+  let*@ sender_nonce_after =
+    Rpc.get_transaction_count full_evm_setup.evm_node ~address:sender.address
   in
   let* tx_object = get_tx_object ~endpoint ~tx_hash in
-  let* tx_receipt = get_transaction_receipt ~full_evm_setup ~tx_hash in
+  let*@! tx_receipt =
+    Rpc.get_transaction_receipt ~tx_hash full_evm_setup.evm_node
+  in
   return
     {
       sender_balance_before;
@@ -1385,7 +1557,8 @@ let make_transfer ?data ~value ~sender ~receiver full_evm_setup =
       receiver_balance_after;
     }
 
-let transfer ?data ~flat_fee ~evm_setup () =
+let transfer ?data ~da_fee_per_byte ~expected_execution_gas ~evm_setup () =
+  let* base_fee_per_gas = Rpc.get_gas_price evm_setup.evm_node in
   let sender, receiver =
     (Eth_account.bootstrap_accounts.(0), Eth_account.bootstrap_accounts.(1))
   in
@@ -1435,29 +1608,46 @@ let transfer ?data ~flat_fee ~evm_setup () =
     ~error_msg:"Unexpected transaction's receiver" ;
   Check.((tx_object.value = value) Wei.typ)
     ~error_msg:"Unexpected transaction's value" ;
-  if Option.is_none data then
-    check_tx_gas_for_flat_fee ~flat_fee ~gas_used ~gas_price ;
+  let data = Option.value ~default:"0x" data in
+  let data = String.sub data 2 (String.length data - 2) in
+  let data_size = Bytes.length @@ Hex.to_bytes @@ `Hex data in
+  check_tx_gas_for_fee
+    ~da_fee_per_byte
+    ~expected_execution_gas
+    ~gas_used
+    ~gas_price
+    ~base_fee_per_gas
+    ~data_size ;
   unit
 
 let test_l2_transfer =
-  let flat_fee = Wei.zero in
-  let test_f ~protocol:_ ~evm_setup = transfer ~evm_setup ~flat_fee () in
+  let da_fee_per_byte = Wei.of_eth_string "0.000002" in
+  let expected_execution_gas = 21000 in
+  let test_f ~protocol:_ ~evm_setup =
+    transfer ~evm_setup ~da_fee_per_byte ~expected_execution_gas ()
+  in
   let title = "Check L2 transfers are applied" in
   let tags = ["evm"; "l2_transfer"] in
-  register_both ~title ~tags test_f
+  register_both ~title ~tags ~da_fee_per_byte test_f
 
 let test_chunked_transaction =
-  let flat_fee = Wei.zero in
+  let da_fee_per_byte = Wei.of_eth_string "0.000002" in
+  let expected_execution_gas = 117000 in
   let test_f ~protocol:_ ~evm_setup =
-    transfer ~data:("0x" ^ String.make 12_000 'a') ~flat_fee ~evm_setup ()
+    transfer
+      ~data:("0x" ^ String.make 12_000 'a')
+      ~da_fee_per_byte
+      ~evm_setup
+      ~expected_execution_gas
+      ()
   in
   let title = "Check L2 chunked transfers are applied" in
   let tags = ["evm"; "l2_transfer"; "chunked"] in
-  register_both ~title ~tags test_f
+  register_both ~title ~tags ~da_fee_per_byte test_f
 
 let test_rpc_txpool_content =
   register_both
-    ~tags:["evm"; "txpool_content"]
+    ~tags:["evm"; "rpc"; "txpool_content"]
     ~title:"Check RPC txpool_content is available"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   (* The content of the txpool is not relevant for now, this test only checks
@@ -1469,7 +1659,7 @@ let test_rpc_txpool_content =
 
 let test_rpc_web3_clientVersion =
   register_both
-    ~tags:["evm"; "client_version"]
+    ~tags:["evm"; "rpc"; "client_version"]
     ~title:"Check RPC web3_clientVersion"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   let* web3_clientVersion =
@@ -1485,7 +1675,7 @@ let test_rpc_web3_clientVersion =
   unit
 
 let test_rpc_web3_sha3 =
-  register_both ~tags:["evm"; "sha3"] ~title:"Check RPC web3_sha3"
+  register_both ~tags:["evm"; "rpc"; "sha3"] ~title:"Check RPC web3_sha3"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   (* From the example provided in
      https://ethereum.org/en/developers/docs/apis/json-rpc/#web3_sha3 *)
@@ -1513,7 +1703,10 @@ let test_simulate =
         Sc_rollup_node.RPC.call sc_rollup_node
         @@ Sc_rollup_rpc.post_global_block_simulate
              ~insight_requests:
-               [`Durable_storage_key ["evm"; "blocks"; "current"; "number"]]
+               [
+                 `Durable_storage_key
+                   ["evm"; "world_state"; "blocks"; "current"; "number"];
+               ]
              []
       in
       let simulated_block_number =
@@ -1527,29 +1720,22 @@ let test_simulate =
         ~error_msg:"The simulation should advance one L2 block" ;
       unit)
 
-let read_tx_from_file () =
-  read_file (kernel_inputs_path ^ "/100-inputs-for-proxy")
-  |> String.trim |> String.split_on_char '\n'
-  |> List.map (fun line ->
-         match String.split_on_char ' ' line with
-         | [tx_raw; tx_hash] -> (tx_raw, tx_hash)
-         | _ -> failwith "Unexpected tx_raw and tx_hash.")
-
 let test_full_blocks =
   register_proxy
     ~config:(`Path (kernel_inputs_path ^ "/100-inputs-for-proxy-config.yaml"))
     ~tags:["evm"; "full_blocks"]
     ~title:
-      "Check `evm_getBlockByNumber` with full blocks returns the correct \
+      "Check `eth_getBlockByNumber` with full blocks returns the correct \
        informations"
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
   let txs =
     read_tx_from_file ()
     |> List.filteri (fun i _ -> i < 5)
     |> List.map (fun (tx, _hash) -> tx)
   in
   let* _requests, receipt, _hashes =
-    send_n_transactions ~sc_rollup_node ~node ~client ~evm_node txs
+    send_n_transactions ~sc_rollup_node ~client ~evm_node txs
   in
   let* block =
     Evm_node.(
@@ -1562,11 +1748,6 @@ let test_full_blocks =
         })
   in
   let block = block |> Evm_node.extract_result |> Block.of_json in
-  let block_hash =
-    match block.hash with
-    | Some hash -> hash
-    | None -> Test.fail "Expected a hash for the block"
-  in
   let block_number = block.number in
   (match block.Block.transactions with
   | Block.Empty -> Test.fail "Expected a non empty block"
@@ -1575,7 +1756,7 @@ let test_full_blocks =
         (fun index
              ({blockHash; blockNumber; transactionIndex; _} :
                Transaction.transaction_object) ->
-          Check.((block_hash = blockHash) string)
+          Check.((block.hash = blockHash) string)
             ~error_msg:
               (sf "The transaction should be in block %%L but found %%R") ;
           Check.((block_number = blockNumber) int32)
@@ -1592,10 +1773,10 @@ let test_latest_block =
   register_proxy
     ~tags:["evm"; "blocks"; "latest"]
     ~title:
-      "Check `evm_getBlockByNumber` works correctly when asking for the \
+      "Check `eth_getBlockByNumber` works correctly when asking for the \
        `latest`"
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
   (* The first execution of the kernel actually builds two blocks: the genesis
      block and the block for the current inbox. As such, the latest block is
      always of level 1. *)
@@ -1636,11 +1817,12 @@ let test_inject_100_transactions =
     ~tags:["evm"; "bigger_blocks"]
     ~title:"Check blocks can contain more than 64 transactions"
     ~config:(`Path (kernel_inputs_path ^ "/100-inputs-for-proxy-config.yaml"))
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
   (* Retrieves all the messages and prepare them for the current rollup. *)
   let txs = read_tx_from_file () |> List.map (fun (tx, _hash) -> tx) in
   let* requests, receipt, _hashes =
-    send_n_transactions ~sc_rollup_node ~node ~client ~evm_node txs
+    send_n_transactions ~sc_rollup_node ~client ~evm_node txs
   in
   let* block_with_100tx =
     Evm_node.(
@@ -1664,7 +1846,7 @@ let test_inject_100_transactions =
       Check.((List.length hashes = List.length requests) int)
         ~error_msg:"Expected %R transactions in the latest block, got %L") ;
 
-  let* _level = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _level = next_evm_level ~evm_node ~sc_rollup_node ~client in
   let*@ latest_evm_level = Rpc.block_number evm_node in
   (* At each loop, the kernel reads the previous block. Until the patch, the
      kernel failed to read the previous block if there was more than 64 hash,
@@ -1677,18 +1859,9 @@ let test_inject_100_transactions =
 
 let check_estimate_gas {evm_node; _} eth_call expected_gas =
   (* Make the call to the EVM node. *)
-  let* call_result =
-    Evm_node.(
-      call_evm_rpc
-        evm_node
-        {
-          method_ = "eth_estimateGas";
-          parameters = `A [`O eth_call; `String "latest"];
-        })
-  in
+  let*@ r = Rpc.estimate_gas eth_call evm_node in
   (* Check the RPC result. *)
-  let r = call_result |> Evm_node.extract_result |> JSON.as_int in
-  Check.((r >= expected_gas) int)
+  Check.((r >= expected_gas) int64)
     ~error_msg:"Expected result greater than %R, but got %L" ;
   unit
 
@@ -1729,7 +1902,7 @@ let test_estimate_gas =
     let data = read_file simple_storage.bin in
     let eth_call = [("data", Ezjsonm.encode_string @@ "0x" ^ data)] in
 
-    check_estimate_gas evm_setup eth_call 23423
+    check_estimate_gas evm_setup eth_call 23423L
   in
 
   let title = "eth_estimateGas for contract creation" in
@@ -1752,7 +1925,7 @@ let test_estimate_gas_additionnal_field =
       ]
     in
 
-    check_estimate_gas evm_setup eth_call 23423
+    check_estimate_gas evm_setup eth_call 23423L
   in
   let title = "eth_estimateGas allows additional fields" in
   let tags = ["evm"; "eth_estimategas"; "simulate"; "remix"] in
@@ -1823,55 +1996,10 @@ let test_eth_call_storage_contract =
   let tags = ["evm"; "eth_call"; "simulate"] in
   register_both ~title ~tags test_f
 
-let test_eth_call_storage_contract_proxy =
-  register_proxy
-    ~tags:["evm"; "simulate"]
-    ~title:"Call a view (directly through rollup node)"
-    (fun ~protocol:_ ~evm_setup ->
-      let {sc_rollup_node; evm_node; _} = evm_setup in
-
-      let endpoint = Evm_node.endpoint evm_node in
-      let sender = Eth_account.bootstrap_accounts.(0) in
-
-      (* deploy contract *)
-      let* address, tx = deploy ~contract:simple_storage ~sender evm_setup in
-      let* () = check_tx_succeeded ~endpoint ~tx in
-
-      Check.(
-        (String.lowercase_ascii address
-        = "0xd77420f73b4612a7a99dba8c2afd30a1886b0344")
-          string
-          ~error_msg:"Expected address to be %R but was %L.") ;
-      let* simulation_result =
-        Sc_rollup_node.RPC.call sc_rollup_node
-        @@ Sc_rollup_rpc.post_global_block_simulate
-             ~insight_requests:
-               [
-                 `Durable_storage_key ["evm"; "simulation_result"];
-                 `Durable_storage_key ["evm"; "simulation_status"];
-               ]
-             [
-               Hex.to_string @@ `Hex "ff";
-               Hex.to_string
-               @@ `Hex
-                    "ff0100e68094d77420f73b4612a7a99dba8c2afd30a1886b03448857040000000000008080844e70b1dc";
-             ]
-      in
-      let expected_insights =
-        [
-          Some "0000000000000000000000000000000000000000000000000000000000000000";
-          Some "01";
-        ]
-      in
-      Check.(
-        (simulation_result.insights = expected_insights) (list @@ option string))
-        ~error_msg:"Expected result %R, but got %L" ;
-      unit)
-
 let test_eth_call_storage_contract_eth_cli =
   let test_f ~protocol:_
-      ~evm_setup:
-        ({evm_node; endpoint; sc_rollup_node; node; client; _} as evm_setup) =
+      ~evm_setup:({evm_node; endpoint; sc_rollup_node; client; _} as evm_setup)
+      =
     (* sanity *)
     let* call_result =
       Evm_node.(
@@ -1901,7 +2029,7 @@ let test_eth_call_storage_contract_eth_cli =
         ~method_call:"num()"
     in
     let* res =
-      wait_for_application ~evm_node ~sc_rollup_node ~node ~client call_num ()
+      wait_for_application ~evm_node ~sc_rollup_node ~client call_num
     in
 
     Check.((String.trim res = "42") string)
@@ -1951,7 +2079,7 @@ let test_preinitialized_evm_kernel =
   unit
 
 let deposit ~amount_mutez ~bridge ~depositor ~receiver ~evm_node ~sc_rollup_node
-    ~sc_rollup_address ~node client =
+    ~sc_rollup_address client =
   let* () =
     Client.transfer
       ~entrypoint:"deposit"
@@ -1964,48 +2092,17 @@ let deposit ~amount_mutez ~bridge ~depositor ~receiver ~evm_node ~sc_rollup_node
   in
   let* () = Client.bake_for_and_wait ~keys:[] client in
 
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
   unit
 
-let withdraw protocol ~commitment_period ~challenge_window ~amount_wei ~sender
-    ~receiver ~evm_node ~sc_rollup_node ~sc_rollup_address ~node ~client
-    ~endpoint =
-  let* withdrawal_level = Client.level client in
-
-  (* Call the withdrawal precompiled contract. *)
-  let* () =
-    Eth_cli.add_abi ~label:"withdraw" ~abi:(withdrawal_abi_path ()) ()
-  in
-  let call_withdraw =
-    Eth_cli.contract_send
-      ~source_private_key:sender.Eth_account.private_key
-      ~endpoint
-      ~abi_label:"withdraw"
-      ~address:"0xff00000000000000000000000000000000000001"
-      ~method_call:(sf {|withdraw_base58("%s")|} receiver)
-      ~value:amount_wei
-  in
-  let* _tx =
-    wait_for_application
-      ~evm_node
-      ~sc_rollup_node
-      ~node
-      ~client
-      call_withdraw
-      ()
-  in
-
-  (* Bake enough levels to have a commitment. *)
+let find_and_execute_withdrawal ~withdrawal_level ~commitment_period
+    ~challenge_window ~evm_node ~sc_rollup_node ~sc_rollup_address ~client =
+  (* Bake enough levels to have a commitment and cement it. *)
   let* _ =
-    repeat (commitment_period * 2) (fun () ->
-        let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
-        unit)
-  in
-
-  (* Bake enough levels to cement the commitment. *)
-  let* _ =
-    repeat (challenge_window + 1) (fun () ->
-        let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+    repeat
+      ((commitment_period * challenge_window) + 3)
+      (fun () ->
+        let* _ = next_rollup_node_level ~sc_rollup_node ~client in
         unit)
   in
 
@@ -2023,53 +2120,75 @@ let withdraw protocol ~commitment_period ~challenge_window ~amount_wei ~sender
           JSON.is_null outbox
           || (JSON.is_list outbox && JSON.as_list outbox = [])
         then aux (level' + 1)
-        else return (outbox, level')
+        else return (JSON.as_list outbox |> List.length, level')
     in
     aux level
   in
-  let* outbox, withdrawal_level = find_outbox withdrawal_level in
-  let outbox_message =
-    JSON.(outbox |=> 0 |-> "message" |-> "transactions" |=> 0)
+  let* size, withdrawal_level = find_outbox withdrawal_level in
+  let execute_withdrawal withdrawal_level message_index =
+    let* outbox_proof =
+      Sc_rollup_node.RPC.call sc_rollup_node
+      @@ Sc_rollup_rpc.outbox_proof_simple
+           ~message_index
+           ~outbox_level:withdrawal_level
+           ()
+    in
+    let Sc_rollup_rpc.{proof; commitment_hash} =
+      match outbox_proof with
+      | Some r -> r
+      | None -> Test.fail "No outbox proof found for the withdrawal"
+    in
+    let*! () =
+      Client.Sc_rollup.execute_outbox_message
+        ~hooks
+        ~burn_cap:(Tez.of_int 10)
+        ~rollup:sc_rollup_address
+        ~src:Constant.bootstrap1.alias
+        ~commitment_hash
+        ~proof
+        client
+    in
+    let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
+    unit
   in
-  let parameters_json = JSON.(outbox_message |-> "parameters") in
-  let batch =
-    {
-      destination = JSON.(outbox_message |-> "destination" |> as_string);
-      entrypoint = Some JSON.(outbox_message |-> "entrypoint" |> as_string);
-      parameters = JSON.unannotate parameters_json;
-      parameters_ty = None;
-    }
+  let* () =
+    Lwt_list.iter_s
+      (fun message_index -> execute_withdrawal withdrawal_level message_index)
+      (List.init size Fun.id)
   in
-  let message_json = Sc_rollup_helpers.json_of_output_tx_batch [batch] in
-  let* message =
-    Codec.encode
-      ~name:(Protocol.encoding_prefix protocol ^ ".smart_rollup.outbox.message")
-      message_json
+  return withdrawal_level
+
+let withdraw ~commitment_period ~challenge_window ~amount_wei ~sender ~receiver
+    ~evm_node ~sc_rollup_node ~sc_rollup_address ~client ~endpoint =
+  let* withdrawal_level = Client.level client in
+
+  (* Call the withdrawal precompiled contract. *)
+  let* () =
+    Eth_cli.add_abi ~label:"withdraw" ~abi:(withdrawal_abi_path ()) ()
   in
-  let* outbox_proof =
-    Sc_rollup_node.RPC.call sc_rollup_node
-    @@ Sc_rollup_rpc.outbox_proof_single
-         ~message_index:0
-         ~outbox_level:withdrawal_level
-         ~message
-         ()
+  let call_withdraw =
+    Eth_cli.contract_send
+      ~source_private_key:sender.Eth_account.private_key
+      ~endpoint
+      ~abi_label:"withdraw"
+      ~address:"0xff00000000000000000000000000000000000001"
+      ~method_call:(sf {|withdraw_base58("%s")|} receiver)
+      ~value:amount_wei
+      ~gas:50_000
   in
-  let Sc_rollup_rpc.{proof; commitment_hash} =
-    match outbox_proof with
-    | Some r -> r
-    | None -> Test.fail "No outbox proof found for the withdrawal"
+  let* _tx =
+    wait_for_application ~evm_node ~sc_rollup_node ~client call_withdraw
   in
-  let*! () =
-    Client.Sc_rollup.execute_outbox_message
-      ~hooks
-      ~burn_cap:(Tez.of_int 10)
-      ~rollup:sc_rollup_address
-      ~src:Constant.bootstrap1.alias
-      ~commitment_hash
-      ~proof
-      client
+  let* _ =
+    find_and_execute_withdrawal
+      ~withdrawal_level
+      ~commitment_period
+      ~challenge_window
+      ~evm_node
+      ~sc_rollup_node
+      ~sc_rollup_address
+      ~client
   in
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
   unit
 
 let check_balance ~receiver ~endpoint expected_balance =
@@ -2091,24 +2210,29 @@ let test_deposit_and_withdraw =
         Constant.octez_smart_rollup_node;
         Constant.octez_evm_node;
         Constant.smart_rollup_installer;
-        Constant.octez_codec;
         Constant.WASM.evm_kernel;
       ])
     ~commitment_period
     ~challenge_window
-  @@ fun ~protocol
+  @@ fun ~protocol:_
              ~evm_setup:
                {
                  client;
                  sc_rollup_address;
                  l1_contracts;
                  sc_rollup_node;
-                 node;
                  endpoint;
                  evm_node;
                  _;
                } ->
-  let {bridge; admin = _; exchanger = _} =
+  let {
+    bridge;
+    admin = _;
+    kernel_governance = _;
+    exchanger = _;
+    sequencer_governance = _;
+    kernel_security_governance = _;
+  } =
     match l1_contracts with
     | Some x -> x
     | None -> Test.fail ~__LOC__ "The test needs the L1 bridge"
@@ -2135,7 +2259,6 @@ let test_deposit_and_withdraw =
       ~receiver:receiver.address
       ~evm_node
       ~sc_rollup_node
-      ~node
       client
   in
   let* () = check_balance ~receiver:receiver.address ~endpoint amount_mutez in
@@ -2147,7 +2270,6 @@ let test_deposit_and_withdraw =
   let withdraw_receiver = "tz1fp5ncDmqYwYC568fREYz9iwQTgGQuKZqX" in
   let* _tx =
     withdraw
-      protocol
       ~evm_node
       ~sc_rollup_address
       ~commitment_period
@@ -2155,7 +2277,6 @@ let test_deposit_and_withdraw =
       ~amount_wei
       ~sender:receiver
       ~receiver:withdraw_receiver
-      ~node
       ~sc_rollup_node
       ~client
       ~endpoint
@@ -2185,9 +2306,9 @@ let get_kernel_boot_wasm ~sc_rollup_node =
   | Some boot_wasm -> return boot_wasm
   | None -> failwith "Kernel `boot.wasm` should be accessible/readable."
 
-let gen_test_kernel_upgrade ?timestamp ?(activation_timestamp = "0")
-    ?(from_ghostnet = false) ?evm_setup ?rollup_address ?(should_fail = false)
-    ~installee ?with_administrator ?expect_l1_failure
+let gen_test_kernel_upgrade ?setup_kernel_root_hash ?admin_contract ?timestamp
+    ?(activation_timestamp = "0") ?evm_setup ?rollup_address
+    ?(should_fail = false) ~installee ?with_administrator ?expect_l1_failure
     ?(admin = Constant.bootstrap1) ?(upgrador = admin) protocol =
   let* {
          node;
@@ -2202,27 +2323,27 @@ let gen_test_kernel_upgrade ?timestamp ?(activation_timestamp = "0")
     | Some evm_setup -> return evm_setup
     | None ->
         setup_evm_kernel
+          ?setup_kernel_root_hash
           ?timestamp
           ?with_administrator
           ~admin:(Some admin)
           protocol
   in
-  let l1_contracts =
-    match l1_contracts with
+  let admin_contract =
+    match admin_contract with
     | Some x -> x
-    | None -> Test.fail "The test requires the l1 contracts."
+    | None ->
+        let l1_contracts = Option.get l1_contracts in
+        l1_contracts.admin
   in
   let sc_rollup_address =
     Option.value ~default:sc_rollup_address rollup_address
   in
   let preimages_dir = Sc_rollup_node.data_dir sc_rollup_node // "wasm_2_0_0" in
-  let* payload =
-    let* {root_hash; _} =
-      Sc_rollup_helpers.prepare_installer_kernel ~preimages_dir installee
-    in
-    if from_ghostnet then return root_hash
-    else Evm_node.upgrade_payload ~root_hash ~activation_timestamp
+  let* {root_hash; _} =
+    Sc_rollup_helpers.prepare_installer_kernel ~preimages_dir installee
   in
+  let* payload = Evm_node.upgrade_payload ~root_hash ~activation_timestamp in
   let* kernel_boot_wasm_before_upgrade = get_kernel_boot_wasm ~sc_rollup_node in
   let* expected_kernel_boot_wasm =
     if should_fail then return kernel_boot_wasm_before_upgrade
@@ -2234,19 +2355,24 @@ let gen_test_kernel_upgrade ?timestamp ?(activation_timestamp = "0")
         ?expect_failure:expect_l1_failure
         ~amount:Tez.zero
         ~giver:upgrador.public_key_hash
-        ~receiver:l1_contracts.admin
+        ~receiver:admin_contract
         ~arg:(sf {|Pair "%s" 0x%s|} sc_rollup_address payload)
         ~burn_cap:Tez.one
         client
     in
-    let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+    let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
     unit
   in
   let* kernel_boot_wasm_after_upgrade = get_kernel_boot_wasm ~sc_rollup_node in
   Check.((expected_kernel_boot_wasm = kernel_boot_wasm_after_upgrade) string)
     ~error_msg:(sf "Unexpected `boot.wasm`.") ;
   return
-    (sc_rollup_node, node, client, evm_node, kernel_boot_wasm_before_upgrade)
+    ( sc_rollup_node,
+      node,
+      client,
+      evm_node,
+      kernel_boot_wasm_before_upgrade,
+      root_hash )
 
 let test_kernel_upgrade_evm_to_evm =
   Protocol.register_test
@@ -2261,7 +2387,7 @@ let test_kernel_upgrade_evm_to_evm =
       ])
     ~title:"Ensures EVM kernel's upgrade integrity to itself"
   @@ fun protocol ->
-  let* sc_rollup_node, node, client, evm_node, _ =
+  let* sc_rollup_node, _node, client, evm_node, _, _root_hash =
     gen_test_kernel_upgrade ~installee:Constant.WASM.evm_kernel protocol
   in
   (* We ensure the upgrade went well by checking if the kernel still produces
@@ -2270,7 +2396,6 @@ let test_kernel_upgrade_evm_to_evm =
   check_block_progression
     ~evm_node
     ~sc_rollup_node
-    ~node
     ~client
     ~endpoint
     ~expected_block_level:2
@@ -2361,12 +2486,26 @@ let test_kernel_upgrade_failing_migration =
       ])
     ~title:"Ensures EVM kernel's upgrade rollback when migration fails"
   @@ fun protocol ->
-  let* sc_rollup_node, node, client, evm_node, _original_kernel_boot_wasm =
+  let* ( sc_rollup_node,
+         _node,
+         client,
+         evm_node,
+         _original_kernel_boot_wasm,
+         root_hash ) =
     gen_test_kernel_upgrade
+      ~setup_kernel_root_hash:false
       ~installee:Constant.WASM.failed_migration
       ~should_fail:true
       protocol
   in
+  let*@! found_root_hash = Rpc.tez_kernelRootHash evm_node in
+  Check.((root_hash <> found_root_hash) string)
+    ~error_msg:"The failed migration should not upgrade the kernel root hash" ;
+  Check.(
+    ("000000000000000000000000000000000000000000000000000000000000000000"
+   = found_root_hash)
+      string)
+    ~error_msg:"The fallback root hash should be %L, got %R" ;
   (* We make sure that we can't read under the tmp file, after migration failed,
      everything is reverted. *)
   let* tmp_dummy =
@@ -2383,50 +2522,96 @@ let test_kernel_upgrade_failing_migration =
   (* We ensure that the fallback mechanism went well by checking if the
      kernel still produces blocks since it has booted back to the previous,
      original kernel. *)
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
   let endpoint = Evm_node.endpoint evm_node in
   check_block_progression
     ~evm_node
     ~sc_rollup_node
-    ~node
     ~client
     ~endpoint
     ~expected_block_level:3
 
-let send_raw_transaction_request raw_tx =
-  Evm_node.
-    {method_ = "eth_sendRawTransaction"; parameters = `A [`String raw_tx]}
+let test_kernel_upgrade_via_governance =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["migration"; "upgrade"; "kernel_governance"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+        Constant.WASM.debug_kernel;
+      ])
+    ~title:"Kernel upgrades using governance contract"
+  @@ fun protocol ->
+  let admin = Constant.bootstrap1 in
+  let* evm_setup =
+    setup_evm_kernel ~with_administrator:true ~admin:(Some admin) protocol
+  in
+  let l1_contracts = Option.get evm_setup.l1_contracts in
+  let* _ =
+    gen_test_kernel_upgrade
+      ~evm_setup
+      ~installee:Constant.WASM.debug_kernel
+      ~admin_contract:l1_contracts.kernel_governance
+      protocol
+  in
+  unit
 
-let send_raw_transaction evm_node raw_tx =
-  let* response =
-    Evm_node.call_evm_rpc evm_node (send_raw_transaction_request raw_tx)
+let test_kernel_upgrade_via_kernel_security_governance =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["migration"; "upgrade"; "kernel_security_governance"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+        Constant.WASM.debug_kernel;
+      ])
+    ~title:"Kernel upgrades using security governance contract"
+  @@ fun protocol ->
+  let admin = Constant.bootstrap1 in
+  let* evm_setup =
+    setup_evm_kernel ~with_administrator:true ~admin:(Some admin) protocol
   in
-  let hash = response |> Evm_node.extract_result |> JSON.as_string_opt in
-  let error_message =
-    response |> Evm_node.extract_error_message |> JSON.as_string_opt
+  let l1_contracts = Option.get evm_setup.l1_contracts in
+  let* _ =
+    gen_test_kernel_upgrade
+      ~evm_setup
+      ~installee:Constant.WASM.debug_kernel
+      ~admin_contract:l1_contracts.kernel_security_governance
+      protocol
   in
-  match (hash, error_message) with
-  | Some hash, _ -> return (Ok hash)
-  | _, Some error_code -> return (Error error_code)
-  | _ -> failwith "invalid response from eth_sendRawTransaction"
+  unit
 
 let test_rpc_sendRawTransaction =
   register_both
-    ~tags:["evm"; "tx_hash"]
+    ~tags:["evm"; "rpc"; "tx_hash"; "raw_tx"]
     ~title:
       "Ensure EVM node returns appropriate hash for any given transactions."
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
-  let txs = read_tx_from_file () |> List.filteri (fun i _ -> i < 5) in
+  let txs =
+    [
+      "f86480825208831e8480946ce4d79d4e77402e1ef3417fdda433aa744c6e1c8080820a95a0964f3d64696410dc1054af0aca06d5a4005a3bdf3db0b919e3de207af93e1004a03eb79935b4e15a576955c104fd6a614437dd0464d382198dde4c52a8eed4061a";
+      "f86480825208831e848094b53dc01974176e5dff2298c5a94343c2585e3c548080820a96a0542124cb9fe80b1c8bd18a07b6ea8292770055c06c2a1b7b0aa82e121c30d0a1a07e9092eb6d303b58c89475f147684a1ae44d0a0248a7409dfc15675555a467e6";
+    ]
+  in
   let* hashes =
     Lwt_list.map_p
-      (fun (tx_raw, _) ->
-        let* hash = send_raw_transaction evm_node tx_raw in
-        let hash = Result.get_ok hash in
+      (fun raw_tx ->
+        let*@ hash = Rpc.send_raw_transaction ~raw_tx evm_node in
         return hash)
       txs
   in
   let expected_hashes =
-    List.map (fun (_, expected_hash) -> expected_hash) txs
+    [
+      "0xb941cbf32821471381b6f003f9013b95c788ad24260d2af54848a5b504c09bb0";
+      "0x6ddd857feb6c81405ea50fb12489ea00cd91193ae36cb41fc119999521422e3a";
+    ]
   in
   Check.((hashes = expected_hashes) (list string))
     ~error_msg:"Unexpected returned hash, should be %R, but got %L" ;
@@ -2454,15 +2639,10 @@ let get_transaction_by_block_arg_and_index ~by evm_node block_hash index =
       transaction_object |-> "result" |> Transaction.transaction_object_of_json)
 
 let test_rpc_getTransactionByBlockArgAndIndex ~by ~evm_setup =
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let txs = read_tx_from_file () |> List.filteri (fun i _ -> i < 3) in
   let* _, _, hashes =
-    send_n_transactions
-      ~sc_rollup_node
-      ~node
-      ~client
-      ~evm_node
-      (List.map fst txs)
+    send_n_transactions ~sc_rollup_node ~client ~evm_node (List.map fst txs)
   in
   Lwt_list.iter_s
     (fun transaction_hash ->
@@ -2470,10 +2650,8 @@ let test_rpc_getTransactionByBlockArgAndIndex ~by ~evm_setup =
         wait_for_application
           ~evm_node
           ~sc_rollup_node
-          ~node
           ~client
           (wait_for_transaction_receipt ~evm_node ~transaction_hash)
-          ()
       in
       let block_arg, index =
         ( (match by with
@@ -2494,13 +2672,76 @@ let test_rpc_getTransactionByBlockArgAndIndex ~by ~evm_setup =
       unit)
     hashes
 
+let test_rpc_getCode =
+  register_both ~tags:["evm"; "rpc"; "get_code"] ~title:"RPC method eth_getCode"
+  @@ fun ~protocol:_ ~evm_setup ->
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let* address, _ = deploy ~contract:simple_storage ~sender evm_setup in
+  let*@ code = Rpc.get_code ~address evm_setup.evm_node in
+  let expected_code =
+    "0x608060405234801561001057600080fd5b50600436106100415760003560e01c80634e70b1dc1461004657806360fe47b1146100645780636d4ce63c14610080575b600080fd5b61004e61009e565b60405161005b91906100d0565b60405180910390f35b61007e6004803603810190610079919061011c565b6100a4565b005b6100886100ae565b60405161009591906100d0565b60405180910390f35b60005481565b8060008190555050565b60008054905090565b6000819050919050565b6100ca816100b7565b82525050565b60006020820190506100e560008301846100c1565b92915050565b600080fd5b6100f9816100b7565b811461010457600080fd5b50565b600081359050610116816100f0565b92915050565b600060208284031215610132576101316100eb565b5b600061014084828501610107565b9150509291505056fea2646970667358221220ec57e49a647342208a1f5c9b1f2049bf1a27f02e19940819f38929bf67670a5964736f6c63430008120033"
+  in
+  Check.((code = expected_code) string)
+    ~error_msg:"Expected code is %R, but got %L" ;
+  unit
+
+let test_rpc_getTransactionByHash =
+  register_both
+    ~tags:["evm"; "rpc"; "get_transaction_by"; "transaction_by_hash"]
+    ~title:"RPC method eth_getTransactionByHash"
+    ~da_fee_per_byte:(Wei.of_eth_string "0.000004")
+  @@ fun ~protocol:_ ~evm_setup ->
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let receiver = Eth_account.bootstrap_accounts.(1) in
+  let value = Wei.one_eth in
+  let estimateGas =
+    [
+      ("from", `String sender.address);
+      ("to", `String receiver.address);
+      ("value", `String (Wei.to_string value));
+    ]
+  in
+  let*@ expected_gas = Rpc.estimate_gas estimateGas evm_node in
+  let submitted_gas = Int64.mul expected_gas 2L in
+  let* expected_gas_price =
+    Rpc.get_gas_price evm_node |> Lwt.map Int64.of_int32
+  in
+  let submitted_gas_price = Int64.mul expected_gas_price 2L in
+  let send =
+    Eth_cli.transaction_send
+      ~source_private_key:sender.Eth_account.private_key
+      ~to_public_key:receiver.Eth_account.address
+      ~value
+      ~endpoint:(Evm_node.endpoint evm_node)
+      ~gas_price:(Wei.to_wei_z (Z.of_int64 submitted_gas_price))
+      ~gas_limit:(Z.of_int64 submitted_gas)
+  in
+  let* transaction_hash =
+    wait_for_application ~evm_node ~sc_rollup_node ~client send
+  in
+  let*@ transaction_object =
+    Rpc.get_transaction_by_hash ~transaction_hash evm_node
+  in
+  Check.(
+    ((transaction_object.hash = transaction_hash) string)
+      ~error_msg:"Incorrect transaction hash, should be %R, but got %L.") ;
+  Check.(
+    ((transaction_object.gas = submitted_gas) int64)
+      ~error_msg:"Incorrect gas on transaction, should be %R, but got %L.") ;
+  Check.(
+    ((transaction_object.gasPrice = submitted_gas_price) int64)
+      ~error_msg:"Incorrect gasPrice on transaction, should be %R, but got %L.") ;
+  unit
+
 let test_rpc_getTransactionByBlockHashAndIndex =
   let config =
     `Path (kernel_inputs_path ^ "/100-inputs-for-proxy-config.yaml")
   in
   register_both
-    ~tags:["evm"; "get_transaction_by"; "block_hash_and_index"]
+    ~tags:["evm"; "rpc"; "get_transaction_by"; "block_hash_and_index"]
     ~title:"RPC method eth_getTransactionByBlockHashAndIndex"
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
     ~config
   @@ fun ~protocol:_ -> test_rpc_getTransactionByBlockArgAndIndex ~by:`Hash
 
@@ -2509,51 +2750,11 @@ let test_rpc_getTransactionByBlockNumberAndIndex =
     `Path (kernel_inputs_path ^ "/100-inputs-for-proxy-config.yaml")
   in
   register_both
-    ~tags:["evm"; "get_transaction_by"; "block_number_and_index"]
+    ~tags:["evm"; "rpc"; "get_transaction_by"; "block_number_and_index"]
     ~title:"RPC method eth_getTransactionByBlockNumberAndIndex"
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
     ~config
   @@ fun ~protocol:_ -> test_rpc_getTransactionByBlockArgAndIndex ~by:`Number
-
-let test_validation_result =
-  register_both
-    ~tags:["evm"; "simulate"]
-    ~title:
-      "Ensure validation returns appropriate address for a given transaction."
-  @@ fun ~protocol:_ ~evm_setup:{sc_rollup_node; _} ->
-  (* tx is a signed legacy transaction obtained with the following data, using
-     the following private key:
-        data = {
-            "nonce": "0x00",
-            "gasPrice": "0x5208",
-            "gasLimit": "0x00",
-            "to": "0x0000000000000000000000000000000000000000",
-            "value": "0x00",
-            "data": "0x",
-            "chainId": 1337
-        }
-        private key=0x84e147b8bc36d99cc6b1676318a0635d8febc9f02897b0563ad27358589ee502
-  *)
-  let tx =
-    "f86180825208809400000000000000000000000000000000000000008080820a95a0f47140763cf73d6d9b342727e5a0809f7997bb62375060932af9bbc2e74b6212a03a018079a2fd7fefb625451ce2fafcdf873b892ff9d4e3e1f2ada5650012f072"
-  in
-  let simulation_msg = "ff0101" ^ tx in
-  let* simulation_result =
-    Sc_rollup_node.RPC.call sc_rollup_node
-    @@ Sc_rollup_rpc.post_global_block_simulate
-         ~insight_requests:
-           [
-             `Durable_storage_key ["evm"; "simulation_status"];
-             `Durable_storage_key ["evm"; "simulation_result"];
-           ]
-         [Hex.to_string @@ `Hex "ff"; Hex.to_string @@ `Hex simulation_msg]
-  in
-  let expected_insights =
-    [Some "01"; Some "f0affc80a5f69f4a9a3ee01a640873b6ba53e539"]
-  in
-  Check.(
-    (simulation_result.insights = expected_insights) (list @@ option string))
-    ~error_msg:"Expected result %R, but got %L" ;
-  unit
 
 type storage_migration_results = {
   transfer_result : transfer_result;
@@ -2573,6 +2774,8 @@ let gen_kernel_migration_test ?config ?(admin = Constant.bootstrap5)
     ~scenario_prior ~scenario_after protocol =
   let* evm_setup =
     setup_evm_kernel
+      ~da_fee_per_byte:Wei.zero
+      ~minimum_base_fee_per_gas:(Wei.of_string "21000")
       ?config
       ~kernel_installee:Constant.WASM.ghostnet_evm_kernel
       ~admin:(Some admin)
@@ -2580,7 +2783,9 @@ let gen_kernel_migration_test ?config ?(admin = Constant.bootstrap5)
   in
   (* Load the EVM rollup's storage and sanity check results. *)
   let* evm_node =
-    Evm_node.init (Sc_rollup_node.endpoint evm_setup.sc_rollup_node)
+    Evm_node.init
+      ~mode:(Proxy {devmode = false})
+      (Sc_rollup_node.endpoint evm_setup.sc_rollup_node)
   in
   let endpoint = Evm_node.endpoint evm_node in
   let* sanity_check =
@@ -2589,7 +2794,6 @@ let gen_kernel_migration_test ?config ?(admin = Constant.bootstrap5)
   (* Upgrade the kernel. *)
   let* _ =
     gen_test_kernel_upgrade
-      ~from_ghostnet:true
       ~evm_setup
       ~installee:Constant.WASM.evm_kernel
       ~admin
@@ -2600,9 +2804,14 @@ let gen_kernel_migration_test ?config ?(admin = Constant.bootstrap5)
     next_evm_level
       ~evm_node
       ~sc_rollup_node:evm_setup.sc_rollup_node
-      ~node:evm_setup.node
       ~client:evm_setup.client
   in
+  let* evm_node =
+    Evm_node.init
+      ~mode:(Proxy {devmode = true})
+      (Sc_rollup_node.endpoint evm_setup.sc_rollup_node)
+  in
+  let evm_setup = {evm_setup with evm_node} in
   (* Check the values after the upgrade with [sanity_check] results. *)
   scenario_after ~evm_setup ~sanity_check
 
@@ -2712,9 +2921,7 @@ let test_deposit_dailynet =
       ~address:rollup_address
       ~parameters_ty:evm_type
       ~installee:Constant.WASM.evm_kernel
-      ~config:
-        (`Path
-          Base.(project_root // "etherlink/kernel_evm/config/dailynet.yaml"))
+      ~config:(`Path Base.(project_root // "etherlink/config/dailynet.yaml"))
       ()
   in
 
@@ -2744,7 +2951,11 @@ let test_deposit_dailynet =
       smart_rollup_node_extra_args
   in
 
-  let* evm_node = Evm_node.init (Sc_rollup_node.endpoint sc_rollup_node) in
+  let* evm_node =
+    Evm_node.init
+      ~mode:(Proxy {devmode = true})
+      (Sc_rollup_node.endpoint sc_rollup_node)
+  in
   let endpoint = Evm_node.endpoint evm_node in
 
   (* Deposit tokens to the EVM rollup. *)
@@ -2760,50 +2971,111 @@ let test_deposit_dailynet =
       ~evm_node
       ~sc_rollup_node
       ~sc_rollup_address:rollup_address
-      ~node
       client
   in
 
   (* Check the balance in the EVM rollup. *)
   check_balance ~receiver ~endpoint amount_mutez
 
+let test_cannot_prepayed_leads_to_no_inclusion =
+  register_both
+    ~tags:["evm"; "prepay"; "inclusion"]
+    ~title:
+      "Not being able to prepay a transaction leads to it not being included."
+    ~bootstrap_accounts:[||]
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  (* No bootstrap accounts, so no one has funds. *)
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
+  (* This is a transfer from Eth_account.bootstrap_accounts.(0) to
+     Eth_account.bootstrap_accounts.(1).  We do not use eth-cli in
+     this test because we want the results of the simulation. *)
+  let raw_transfer =
+    "0xf86d80843b9aca00825b0494b53dc01974176e5dff2298c5a94343c2585e3c54880de0b6b3a764000080820a96a07a3109107c6bd1d555ce70d6253056bc18996d4aff4d4ea43ff175353f49b2e3a05f9ec9764dc4a3c3ab444debe2c3384070de9014d44732162bb33ee04da187ef"
+  in
+  let*@? error = Rpc.send_raw_transaction ~raw_tx:raw_transfer evm_node in
+  Check.(
+    ((error.message = "Cannot prepay transaction.") string)
+      ~error_msg:"The transaction should fail") ;
+  unit
+
+let test_cannot_prepayed_with_delay_leads_to_no_injection =
+  register_both
+    ~tags:["evm"; "prepay"; "injection"]
+    ~title:
+      "Not being able to prepay a transaction that was included leads to it \
+       not being injected."
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; endpoint; _}
+    ->
+  let sender, to_public_key =
+    ( Eth_account.bootstrap_accounts.(0),
+      "0xE7f682c226d7269C7247b878B3F94c7a8d31FEf5" )
+  in
+  let transaction_included =
+    Eth_cli.transaction_send
+      ~source_private_key:sender.Eth_account.private_key
+      ~to_public_key
+      ~value:Wei.one
+      ~endpoint
+  in
+  (* Transaction from previous sender to the same address but with nonce 1 and
+     a gas computation that will lead it to not being able to be prepayed hence
+     rejected at injection. *)
+  let raw_tx =
+    "f86501830186a0830186a094e7f682c226d7269c7247b878b3f94c7a8d31fef58080820a95a0a9afcb6020f31b62e45778a051c62e71ce5c52789ba6ab487812f21271a98291a03673d60e267b6d32ecd22403cb54c088ee897e0c1862aa3f48039671503957d1"
+  in
+  let*@ transaction_hash = Rpc.send_raw_transaction ~raw_tx evm_node in
+  let* _will_succeed =
+    wait_for_application ~evm_node ~sc_rollup_node ~client transaction_included
+  in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
+  let wait_for_failure () =
+    let* _ =
+      wait_for_application
+        ~evm_node
+        ~sc_rollup_node
+        ~client
+        (wait_for_transaction_receipt ~evm_node ~transaction_hash)
+    in
+    Test.fail "Unreachable state, transaction will never be injected."
+  in
+  Lwt.catch wait_for_failure (function _ -> unit)
+
 let test_rpc_sendRawTransaction_nonce_too_low =
   register_both
-    ~tags:["evm"; "nonce"]
+    ~tags:["evm"; "rpc"; "nonce"]
     ~title:"Returns an error if the nonce is too low"
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
   (* Nonce: 0 *)
   let raw_tx =
     "0xf86c80825208831e8480940000000000000000000000000000000000000000888ac7230489e8000080820a96a038294f867266c767aee6c3b54a0c444368fb8d5e90353219bce1da78de16aea4a018a7d3c58ddb1f6b33bad5dde106843acfbd6467e5df181d22270229dcfdf601"
   in
-  let* result = send_raw_transaction evm_node raw_tx in
-  let transaction_hash = Result.get_ok result in
+  let*@ transaction_hash = Rpc.send_raw_transaction ~raw_tx evm_node in
   let* _ =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (wait_for_transaction_receipt ~evm_node ~transaction_hash)
-      ()
   in
-  let* result = send_raw_transaction evm_node raw_tx in
-  let error_message = Result.get_error result in
+  let*@? error = Rpc.send_raw_transaction ~raw_tx evm_node in
   Check.(
-    ((error_message = "Nonce too low.") string)
+    ((error.message = "Nonce too low.") string)
       ~error_msg:"The transaction should fail") ;
   unit
 
 let test_rpc_sendRawTransaction_nonce_too_high =
   register_both
-    ~tags:["evm"; "nonce"]
+    ~tags:["evm"; "rpc"; "nonce"]
     ~title:"Accepts transactions with nonce too high."
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
   (* Nonce: 1 *)
   let raw_tx =
     "0xf86c01825208831e8480940000000000000000000000000000000000000000888ac7230489e8000080820a95a0a349864bedc9b84aea88cda197e96538c62c242286ead58eb7180a611f850237a01206525ff16ae5b708ee02b362f9b4d7565e0d7e9b4c536d7ef7dec81cda3ac7"
   in
-  let* result = send_raw_transaction evm_node raw_tx in
+  let* result = Rpc.send_raw_transaction ~raw_tx evm_node in
   Check.(
     ((Result.is_ok result = true) bool) ~error_msg:"The transaction should fail") ;
   unit
@@ -2832,7 +3104,6 @@ let test_deposit_before_and_after_migration =
           l1_contracts;
           sc_rollup_node;
           sc_rollup_address;
-          node;
           client;
           endpoint;
           evm_node;
@@ -2850,7 +3121,6 @@ let test_deposit_before_and_after_migration =
         ~evm_node
         ~sc_rollup_node
         ~sc_rollup_address
-        ~node
         client
     in
     check_balance ~receiver ~endpoint amount_mutez
@@ -2861,7 +3131,6 @@ let test_deposit_before_and_after_migration =
           l1_contracts;
           sc_rollup_node;
           sc_rollup_address;
-          node;
           client;
           endpoint;
           evm_node;
@@ -2879,7 +3148,6 @@ let test_deposit_before_and_after_migration =
         ~evm_node
         ~sc_rollup_node
         ~sc_rollup_address
-        ~node
         client
     in
     check_balance ~receiver ~endpoint Tez.(amount_mutez + amount_mutez)
@@ -2901,9 +3169,9 @@ let test_block_storage_before_and_after_migration =
     ~title:"Block storage before and after migration"
   @@ fun protocol ->
   let block_id = "1" in
-  let scenario_prior
-      ~evm_setup:{endpoint; evm_node; sc_rollup_node; node; client; _} =
-    let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let scenario_prior ~evm_setup:{endpoint; evm_node; sc_rollup_node; client; _}
+      =
+    let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
     let* (block : Block.t) = Eth_cli.get_block ~block_id ~endpoint in
     return block
   in
@@ -2921,7 +3189,7 @@ let test_block_storage_before_and_after_migration =
 let test_rpc_sendRawTransaction_invalid_chain_id =
   Protocol.register_test
     ~__FILE__
-    ~tags:["evm"; "chain_id"]
+    ~tags:["evm"; "rpc"; "chain_id"]
     ~uses:(fun _protocol ->
       [
         Constant.octez_smart_rollup_node;
@@ -2936,20 +3204,11 @@ let test_rpc_sendRawTransaction_invalid_chain_id =
   let raw_tx =
     "0xf86a8080831e8480940000000000000000000000000000000000000000888ac7230489e8000080822148a0e09f1fb4920f2e64a274b83d925890dd0b109fdf31f2811a781e918118daf34aa00f425e9a93bd92d710d3d323998b093a8c7d497d2af688c062a8099b076813e8"
   in
-  let* result = send_raw_transaction evm_node raw_tx in
-  let error_message = Result.get_error result in
+  let*@? error = Rpc.send_raw_transaction ~raw_tx evm_node in
   Check.(
-    ((error_message = "Invalid chain id.") string)
+    ((error.message = "Invalid chain id.") string)
       ~error_msg:"The transaction should fail") ;
   unit
-
-let tez_kernelVersion evm_node =
-  let* json =
-    Evm_node.call_evm_rpc
-      evm_node
-      Evm_node.{method_ = "tez_kernelVersion"; parameters = `Null}
-  in
-  return JSON.(json |-> "result" |> as_string)
 
 let test_kernel_upgrade_version_change =
   Protocol.register_test
@@ -2965,9 +3224,12 @@ let test_kernel_upgrade_version_change =
       ])
     ~title:"Kernel version changes after an upgrade"
   @@ fun protocol ->
-  let scenario_prior ~evm_setup = tez_kernelVersion evm_setup.evm_node in
+  let scenario_prior ~evm_setup =
+    let*@ old_ = Rpc.tez_kernelVersion evm_setup.evm_node in
+    return old_
+  in
   let scenario_after ~evm_setup ~sanity_check:old =
-    let* new_ = tez_kernelVersion evm_setup.evm_node in
+    let*@ new_ = Rpc.tez_kernelVersion evm_setup.evm_node in
     Check.((old <> new_) string)
       ~error_msg:"The kernel version must change after an upgrade" ;
     unit
@@ -3018,7 +3280,7 @@ let test_kernel_upgrade_delay =
   let activation_timestamp = "2020-01-01T00:00:10Z" in
   (* It shoulnd't be upgrade in a single block, which {!gen_test_kernel_upgrade}
      expect. *)
-  let* sc_rollup_node, node, client, evm_node, _ =
+  let* sc_rollup_node, _node, client, evm_node, _, _root_hash =
     gen_test_kernel_upgrade
       ~timestamp
       ~activation_timestamp
@@ -3028,7 +3290,7 @@ let test_kernel_upgrade_delay =
   in
   let* _ =
     repeat 5 (fun _ ->
-        let* _ = next_evm_level ~sc_rollup_node ~node ~client ~evm_node in
+        let* _ = next_evm_level ~sc_rollup_node ~client ~evm_node in
         unit)
   in
   let kernel_debug_content = read_file (Uses.path Constant.WASM.debug_kernel) in
@@ -3056,82 +3318,95 @@ let test_transaction_storage_before_and_after_migration =
   in
   let txs = read_tx_from_file () |> List.filteri (fun i _ -> i < 3) in
   let raw_txs, tx_hashes = List.split txs in
-  let scenario_prior ~evm_setup:{sc_rollup_node; node; client; evm_node; _} =
+  let check_one evm_setup tx_hash =
+    let*@ _receipt = Rpc.get_transaction_receipt ~tx_hash evm_setup.evm_node in
+    let* _tx_object = get_tx_object ~endpoint:evm_setup.endpoint ~tx_hash in
+    unit
+  in
+  let scenario_prior
+      ~evm_setup:({sc_rollup_node; client; evm_node; _} as evm_setup) =
     let* _requests, _receipt, _hashes =
-      send_n_transactions ~sc_rollup_node ~node ~client ~evm_node raw_txs
+      send_n_transactions ~sc_rollup_node ~client ~evm_node raw_txs
     in
-    return ()
+    Lwt_list.iter_p (check_one evm_setup) tx_hashes
   in
   let scenario_after ~evm_setup ~sanity_check:() =
-    let check_one tx_hash =
-      let* _receipt =
-        get_transaction_receipt ~full_evm_setup:evm_setup ~tx_hash
-      in
-      let* _tx_object = get_tx_object ~endpoint:evm_setup.endpoint ~tx_hash in
-      unit
-    in
-    Lwt_list.iter_p check_one tx_hashes
+    Lwt_list.iter_p (check_one evm_setup) tx_hashes
   in
   gen_kernel_migration_test ~config ~scenario_prior ~scenario_after protocol
+
+let test_kernel_root_hash_originate_absent =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "kernel_root_hash"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:"Kernel root hash is absent at origination if not provided"
+  @@ fun protocol ->
+  let* {evm_node; _} =
+    setup_evm_kernel ~admin:None ~setup_kernel_root_hash:false protocol
+  in
+  let*@ kernel_root_hash_opt = Rpc.tez_kernelRootHash evm_node in
+  Assert.is_none ~loc:__LOC__ kernel_root_hash_opt ;
+  unit
+
+let test_kernel_root_hash_originate_present =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "kernel_root_hash"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:"tez_kernelRootHash takes root hash provided by the installer"
+  @@ fun protocol ->
+  let* {evm_node; kernel_root_hash; _} =
+    setup_evm_kernel ~admin:None ~setup_kernel_root_hash:true protocol
+  in
+  let*@! found_kernel_root_hash = Rpc.tez_kernelRootHash evm_node in
+  Check.((kernel_root_hash = found_kernel_root_hash) string)
+    ~error_msg:
+      "tez_kernelRootHash should return root hash set by installer after \
+       origination" ;
+  unit
+
+let test_kernel_root_hash_after_upgrade =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "kernel_root_hash"; "upgrade"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:"tez_kernelRootHash is set after upgrade"
+  @@ fun protocol ->
+  let* _sc_rollup_node, _node, _client, evm_node, _, root_hash =
+    gen_test_kernel_upgrade
+      ~activation_timestamp:"0"
+      ~installee:Constant.WASM.evm_kernel
+      protocol
+  in
+  let*@! found_kernel_root_hash = Rpc.tez_kernelRootHash evm_node in
+  Check.((found_kernel_root_hash = root_hash) string)
+    ~error_msg:"Found incorrect kernel root hash (expected %L, got %R)" ;
+  unit
 
 let register_evm_migration ~protocols =
   test_kernel_migration protocols ;
   test_deposit_before_and_after_migration protocols ;
   test_block_storage_before_and_after_migration protocols ;
   test_transaction_storage_before_and_after_migration protocols
-
-let test_reboot =
-  register_proxy
-    ~tags:["evm"; "reboot"; "loop"]
-    ~title:"Check that the kernel can handle too many txs for a single run"
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
-  (* Retrieves all the messages and prepare them for the current rollup. *)
-  let transfers =
-    read_file (kernel_inputs_path ^ "/100-loops-transfers")
-    |> String.trim |> String.split_on_char '\n'
-  in
-  let txs =
-    read_file (kernel_inputs_path ^ "/100-loops")
-    |> String.trim |> String.split_on_char '\n'
-  in
-  let* _, _transfer_receipt, _ =
-    send_n_transactions ~sc_rollup_node ~node ~client ~evm_node transfers
-  in
-  let* requests, receipt, _hashes =
-    send_n_transactions ~sc_rollup_node ~node ~client ~evm_node txs
-  in
-  let* block_with_many_txs =
-    Evm_node.(
-      call_evm_rpc
-        evm_node
-        {
-          method_ = "eth_getBlockByNumber";
-          parameters =
-            `A
-              [`String (Format.sprintf "%#lx" receipt.blockNumber); `Bool false];
-        })
-  in
-  let block_with_many_txs =
-    block_with_many_txs |> Evm_node.extract_result |> Block.of_json
-  in
-  (match block_with_many_txs.Block.transactions with
-  | Block.Empty -> Test.fail "Expected a non empty block"
-  | Block.Full _ ->
-      Test.fail "Block is supposed to contain only transaction hashes"
-  | Block.Hash hashes ->
-      Check.((List.length hashes = List.length requests) int)
-        ~error_msg:"Expected %R transactions in the latest block, got %L") ;
-  let* tick_number =
-    Sc_rollup_node.RPC.call sc_rollup_node
-    @@ Sc_rollup_rpc.get_global_block_ticks ()
-  in
-  let max_tick =
-    Tezos_protocol_alpha.Protocol.Sc_rollup_wasm.V2_0_0.ticks_per_snapshot
-  in
-  Check.((tick_number > Z.to_int max_tick) int)
-    ~error_msg:
-      "Expected %L to be greater than %R, max nb of ticks per kernel run" ;
-  unit
 
 let block_transaction_count_by ~by arg =
   let method_ = "eth_getBlockTransactionCountBy" ^ by_block_arg_string by in
@@ -3148,21 +3423,17 @@ let test_rpc_getBlockTransactionCountBy =
     `Path (kernel_inputs_path ^ "/100-inputs-for-proxy-config.yaml")
   in
   register_both
-    ~tags:["evm"; "get_block_transaction_count_by"]
+    ~tags:["evm"; "rpc"; "get_block_transaction_count_by"]
     ~title:
       "RPC methods eth_getBlockTransactionCountByHash and \
        eth_getBlockTransactionCountByNumber"
     ~config
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let txs = read_tx_from_file () |> List.filteri (fun i _ -> i < 5) in
   let* _, receipt, _ =
-    send_n_transactions
-      ~sc_rollup_node
-      ~node
-      ~client
-      ~evm_node
-      (List.map fst txs)
+    send_n_transactions ~sc_rollup_node ~client ~evm_node (List.map fst txs)
   in
   let* block = get_block_by_hash evm_setup receipt.blockHash in
   let expected_count =
@@ -3202,7 +3473,7 @@ let get_uncle_count_by_block_arg evm_node ~by arg =
 
 let test_rpc_getUncleCountByBlock =
   register_both
-    ~tags:["evm"; "get_uncle_count_by_block"]
+    ~tags:["evm"; "rpc"; "get_uncle_count_by_block"]
     ~title:
       "RPC methods eth_getUncleCountByBlockHash and \
        eth_getUncleCountByBlockNumber"
@@ -3210,7 +3481,7 @@ let test_rpc_getUncleCountByBlock =
   let evm_node_endpoint = Evm_node.endpoint evm_node in
   let* block = Eth_cli.get_block ~block_id:"0" ~endpoint:evm_node_endpoint in
   let* uncle_count =
-    get_uncle_count_by_block_arg evm_node ~by:`Hash (Option.get block.hash)
+    get_uncle_count_by_block_arg evm_node ~by:`Hash block.hash
   in
   Check.((uncle_count = Int64.zero) int64)
     ~error_msg:
@@ -3246,7 +3517,7 @@ let get_uncle_by_block_arg_and_index ~by evm_node arg index =
 
 let test_rpc_getUncleByBlockArgAndIndex =
   register_both
-    ~tags:["evm"; "get_uncle_by_block_arg_and_index"]
+    ~tags:["evm"; "rpc"; "get_uncle_by_block_arg_and_index"]
     ~title:
       "RPC methods eth_getUncleByBlockHashAndIndex and \
        eth_getUncleByBlockNumberAndIndex"
@@ -3255,11 +3526,7 @@ let test_rpc_getUncleByBlockArgAndIndex =
   let block_id = "0" in
   let* block = Eth_cli.get_block ~block_id ~endpoint:evm_node_endpoint in
   let* uncle =
-    get_uncle_by_block_arg_and_index
-      ~by:`Hash
-      evm_node
-      (Option.get block.hash)
-      block_id
+    get_uncle_by_block_arg_and_index ~by:`Hash evm_node block.hash block_id
   in
   assert (Option.is_none uncle) ;
   let* uncle =
@@ -3277,7 +3544,7 @@ let test_simulation_eip2200 =
     ~tags:["evm"; "loop"; "simulation"; "eip2200"]
     ~title:"Simulation is EIP2200 resilient"
   @@ fun ~protocol:_ ~evm_setup ->
-  let {sc_rollup_node; node; client; endpoint; evm_node; _} = evm_setup in
+  let {sc_rollup_node; client; endpoint; evm_node; _} = evm_setup in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* loop_address, _tx = deploy ~contract:loop ~sender evm_setup in
   (* If we support EIP-2200, the simulation gives an amount of gas
@@ -3291,105 +3558,61 @@ let test_simulation_eip2200 =
       ~address:loop_address
       ~method_call:"loop(5)"
   in
-  let* _tx =
-    wait_for_application ~evm_node ~sc_rollup_node ~node ~client call ()
-  in
+  let* _tx = wait_for_application ~evm_node ~sc_rollup_node ~client call in
   unit
 
-let test_cover_fees =
-  register_both
-    ~tags:["evm"; "validity"]
-    ~title:"Transaction is invalid if sender cannot cover the fees"
-    ~bootstrap_accounts:[||]
-  (* No bootstrap accounts, so no one has funds. *)
-  @@ fun ~protocol:_
-             ~evm_setup:{evm_node; endpoint; sc_rollup_node; node; client; _} ->
-  (* This is a transfer from Eth_account.bootstrap_accounts.(0) to
-     Eth_account.bootstrap_accounts.(1).  We do not use eth-cli in
-     this test because we want the results of the simulation. *)
-  let raw_transfer =
-    "0xf86d80843b9aca00825b0494b53dc01974176e5dff2298c5a94343c2585e3c54880de0b6b3a764000080820a96a07a3109107c6bd1d555ce70d6253056bc18996d4aff4d4ea43ff175353f49b2e3a05f9ec9764dc4a3c3ab444debe2c3384070de9014d44732162bb33ee04da187ef"
-  in
-  (* This should fail when the tx-pool check this. *)
-  let* hash_result = send_raw_transaction evm_node raw_transfer in
-  let hash =
-    match hash_result with
-    | Ok hash -> hash
-    | Error _ -> Test.fail "The proxy did not accept the transaction."
-  in
-  (* No receipt should be produced for an invalid transaction. *)
-  let rec check_for_receipt blocks_left =
-    if blocks_left = 0 then unit
-    else
-      let* receipt = Eth_cli.get_receipt ~endpoint ~tx:hash in
-      match receipt with
-      | Some _ -> Test.fail "An invalid transaction should not have a receipt."
-      | None ->
-          let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
-          check_for_receipt (blocks_left - 1)
-  in
-  check_for_receipt 6
-
 let test_rpc_sendRawTransaction_with_consecutive_nonce =
-  register_both ~tags:["evm"; "tx_nonce"] ~title:"Can submit many transactions."
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; node; client; sc_rollup_node; _} ->
+  register_both
+    ~tags:["evm"; "rpc"; "tx_nonce"]
+    ~title:"Can submit many transactions."
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; client; sc_rollup_node; _} ->
   (* TODO: https://gitlab.com/tezos/tezos/-/issues/6520 *)
   (* Nonce: 0*)
   let tx_1 =
     "0xf86480825208831e84809400000000000000000000000000000000000000008080820a96a0718d24970c6d2fc794e972f4319caf24a939ff3d822959c7e6b022813d16c8c4a04535ad83a67307759569b1e2087b0b79f80d4502027b6d1d52e3c072634b3f8b"
   in
-  let* result = send_raw_transaction evm_node tx_1 in
-  let hash_1 = Result.get_ok result in
+  let*@ hash_1 = Rpc.send_raw_transaction ~raw_tx:tx_1 evm_node in
   (* TODO: https://gitlab.com/tezos/tezos/-/issues/6520 *)
   (* Nonce: 1*)
   let tx_2 =
     "0xf86401825208831e84809400000000000000000000000000000000000000008080820a95a01f47f2ec950d998bd99f7ff656a7f13a385603373f0e96130290ba2869f56515a018bd20697ab1f3cd82891663c62f514de7b2deeee2ed569e85b3aa351e1b1c3b"
   in
-  let* result = send_raw_transaction evm_node tx_2 in
-  let hash_2 = Result.get_ok result in
+  let*@ hash_2 = Rpc.send_raw_transaction ~raw_tx:tx_2 evm_node in
   let* _ =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (wait_for_transaction_receipt ~evm_node ~transaction_hash:hash_1)
-      ()
   in
   let* _ =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (wait_for_transaction_receipt ~evm_node ~transaction_hash:hash_2)
-      ()
   in
   unit
 
 let test_rpc_sendRawTransaction_not_included =
   register_both
-    ~tags:["evm"; "tx_nonce"]
+    ~tags:["evm"; "rpc"; "tx_nonce"; "no_inclusion"]
     ~title:
       "Tx with nonce too high are not included without previous transactions."
-  @@ fun ~protocol:_
-             ~evm_setup:{evm_node; node; client; sc_rollup_node; endpoint; _} ->
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; client; sc_rollup_node; endpoint; _}
+    ->
   (* TODO: https://gitlab.com/tezos/tezos/-/issues/6520 *)
   (* Nonce: 1 *)
   let tx =
-    "0xf86401825208831e84809400000000000000000000000000000000000000008080820a96a05709a6fbce9cf391d0530f4b4d4c9fd57fa160dd20fead5bd5c49c3ec78efcc9a06e4fcb1d5596e00bc34fa5d97ccafce8fa1f44534b36920d7db0a3ad29ca03f8"
+    "f86401825208831e8480946ce4d79d4e77402e1ef3417fdda433aa744c6e1c8080820a95a07298a47ad7fcbe70dc9d3705af6e47147364c5ac8ede95fb561ffaa3443dd776a07042e72941ffdef02c773b7289d7e4241a5c819e78c7bfb362c7f151b0ba3e9e"
   in
-  let* result =
-    wait_for_application
-      ~evm_node
-      ~sc_rollup_node
-      ~node
-      ~client
-      (fun () -> send_raw_transaction evm_node tx)
-      ()
+  let*@ tx_hash =
+    wait_for_application ~evm_node ~sc_rollup_node ~client (fun () ->
+        Rpc.send_raw_transaction ~raw_tx:tx evm_node)
   in
-  let tx_hash = Result.get_ok result in
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
   (* Check if txs is not included *)
   let* receipt = Eth_cli.get_receipt ~endpoint ~tx:tx_hash in
   Check.((Option.is_none receipt = true) bool)
@@ -3398,22 +3621,24 @@ let test_rpc_sendRawTransaction_not_included =
   unit
 
 let test_rpc_gasPrice =
-  register_both ~tags:["evm"; "gas_price"] ~title:"RPC methods eth_gasPrice"
+  register_both
+    ~tags:["evm"; "rpc"; "gas_price"]
+    ~title:"RPC methods eth_gasPrice"
   @@ fun ~protocol:_ ~evm_setup:{evm_node; _} ->
-  let expected_gas_price = 21_000l in
+  let expected_gas_price = Wei.of_gwei_string "1" in
   let* gas_price =
     Evm_node.(
       let* price =
         call_evm_rpc evm_node {method_ = "eth_gasPrice"; parameters = `A []}
       in
-      return JSON.(price |-> "result" |> as_int64))
+      return JSON.(price |-> "result" |> as_int64 |> Z.of_int64 |> Wei.to_wei_z))
   in
-  Check.((gas_price = Int64.of_int32 expected_gas_price) int64)
+  Check.((gas_price = expected_gas_price) Wei.typ)
     ~error_msg:"Expected %R, but got %L" ;
   unit
 
 let send_foo_mapping_storage contract_address sender
-    {sc_rollup_node; node; client; endpoint; evm_node; _} =
+    {sc_rollup_node; client; endpoint; evm_node; _} =
   let call_foo (sender : Eth_account.t) =
     Eth_cli.contract_send
       ~source_private_key:sender.private_key
@@ -3422,17 +3647,11 @@ let send_foo_mapping_storage contract_address sender
       ~address:contract_address
       ~method_call:"foo()"
   in
-  wait_for_application
-    ~evm_node
-    ~sc_rollup_node
-    ~node
-    ~client
-    (call_foo sender)
-    ()
+  wait_for_application ~evm_node ~sc_rollup_node ~client (call_foo sender)
 
 let test_rpc_getStorageAt =
   register_both
-    ~tags:["evm"; "get_storage_at"]
+    ~tags:["evm"; "rpc"; "get_storage_at"]
     ~title:"RPC methods eth_getStorageAt"
   @@ fun ~protocol:_ ~evm_setup ->
   let {endpoint; evm_node; _} = evm_setup in
@@ -3460,7 +3679,8 @@ let test_rpc_getStorageAt =
       in
       return JSON.(value |-> "result" |> as_string))
   in
-  Check.((Helpers.no_0x hex_value = hex_256_of expected_value0) string)
+  Check.(
+    (Durable_storage_path.no_0x hex_value = hex_256_of expected_value0) string)
     ~error_msg:"Expected %R, but got %L" ;
   let pos = Helpers.mapping_position sender.address 1 in
   let* hex_value =
@@ -3475,7 +3695,8 @@ let test_rpc_getStorageAt =
       in
       return JSON.(value |-> "result" |> as_string))
   in
-  Check.((Helpers.no_0x hex_value = hex_256_of expected_value1) string)
+  Check.(
+    (Durable_storage_path.no_0x hex_value = hex_256_of expected_value1) string)
     ~error_msg:"Expected %R, but got %L" ;
   unit
 
@@ -3490,7 +3711,7 @@ let test_accounts_double_indexing =
       @@ Sc_rollup_rpc.get_global_block_durable_state_value
            ~pvm_kind:"wasm_2_0_0"
            ~operation:Sc_rollup_rpc.Value
-           ~key:"/evm/indexes/accounts/length"
+           ~key:"/evm/world_state/indexes/accounts/length"
            ()
     in
     let length = Option.map Helpers.hex_string_to_int length in
@@ -3513,10 +3734,10 @@ let test_originate_evm_kernel_and_dump_pvm_state =
   register_proxy
     ~tags:["evm"]
     ~title:"Originate EVM kernel with installer and dump PVM state"
-  @@ fun ~protocol:_ ~evm_setup:{node; client; sc_rollup_node; evm_node; _} ->
+  @@ fun ~protocol:_ ~evm_setup:{client; sc_rollup_node; evm_node; _} ->
   (* First run of the installed EVM kernel, it will initialize the directory
      "eth_accounts". *)
-  let* _level = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _level = next_evm_level ~evm_node ~sc_rollup_node ~client in
   let dump = Temp.file "dump.json" in
   let* () = Sc_rollup_node.dump_durable_storage ~sc_rollup_node ~dump () in
   let installer = Installer_kernel_config.of_json dump in
@@ -3564,7 +3785,7 @@ let test_l2_call_inter_contract =
     ~title:"Check L2 inter contract call"
   @@ fun protocol ->
   (* setup *)
-  let* ({evm_node; sc_rollup_node; node; client; _} as evm_setup) =
+  let* ({evm_node; sc_rollup_node; client; _} as evm_setup) =
     setup_evm_kernel ~admin:None protocol
   in
   let endpoint = Evm_node.endpoint evm_node in
@@ -3586,10 +3807,8 @@ let test_l2_call_inter_contract =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_set_directly sender 20)
-      ()
   in
 
   let* () = check_tx_succeeded ~endpoint ~tx in
@@ -3614,10 +3833,8 @@ let test_l2_call_inter_contract =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_set_from_caller sender 10)
-      ()
   in
 
   let* () = check_tx_succeeded ~endpoint ~tx in
@@ -3633,6 +3850,10 @@ let get_logs_request ?from_block ?to_block ?address ?topics () =
     | [t] -> `String t
     | l -> `A (List.map (fun s -> `String s) l)
   in
+  let parse_address = function
+    | `Single a -> `String a
+    | `List l -> `A (List.map (fun a -> `String a) l)
+  in
   let parameters : JSON.u =
     `A
       [
@@ -3647,7 +3868,7 @@ let get_logs_request ?from_block ?to_block ?address ?topics () =
               to_block
           @ Option.fold
               ~none:[]
-              ~some:(fun a -> [("address", `String a)])
+              ~some:(fun a -> [("address", parse_address a)])
               address
           @ Option.fold
               ~none:[]
@@ -3657,10 +3878,10 @@ let get_logs_request ?from_block ?to_block ?address ?topics () =
   in
   Evm_node.{method_ = "eth_getLogs"; parameters}
 
-let get_logs ?from_block ?to_block ?address ?topics proxy_server =
+let get_logs ?from_block ?to_block ?address ?topics evm_node =
   let* response =
     Evm_node.call_evm_rpc
-      proxy_server
+      evm_node
       (get_logs_request ?from_block ?to_block ?address ?topics ())
   in
   return
@@ -3669,7 +3890,7 @@ let get_logs ?from_block ?to_block ?address ?topics proxy_server =
 let test_rpc_getLogs =
   register_both ~tags:["evm"; "rpc"; "get_logs"] ~title:"Check getLogs RPC"
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; node; client; sc_rollup_node; _} = evm_setup in
+  let {evm_node; client; sc_rollup_node; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let player = Eth_account.bootstrap_accounts.(1) in
@@ -3715,39 +3936,37 @@ let test_rpc_getLogs =
   in
   (* sender mints 42 *)
   let* tx1 =
-    wait_for_application
-      ~evm_node
-      ~sc_rollup_node
-      ~node
-      ~client
-      (call_mint sender 42)
-      ()
+    wait_for_application ~evm_node ~sc_rollup_node ~client (call_mint sender 42)
   in
   (* player mints 100 *)
   let* _tx =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_mint player 100)
-      ()
   in
   (* sender burns 42 *)
   let* _tx =
-    wait_for_application
-      ~evm_node
-      ~sc_rollup_node
-      ~node
-      ~client
-      (call_burn sender 42)
-      ()
+    wait_for_application ~evm_node ~sc_rollup_node ~client (call_burn sender 42)
   in
   (* Check that there have been 3 logs in total *)
   let* all_logs = get_logs ~from_block:"0" evm_node in
   Check.((List.length all_logs = 3) int) ~error_msg:"Expected %R logs, got %L" ;
   (* Check that the [address] contract has produced 3 logs in total *)
-  let* contract_logs = get_logs ~from_block:"0" ~address evm_node in
+  let* contract_logs =
+    get_logs ~from_block:"0" ~address:(`Single address) evm_node
+  in
+  Check.((List.length contract_logs = 3) int)
+    ~error_msg:"Expected %R logs, got %L" ;
+  (* Same check also works if [address] is the second in the addresses
+     list *)
+  let* contract_logs =
+    get_logs
+      ~from_block:"0"
+      ~address:(`List ["0x0000000000000000000000000000000000000000"; address])
+      evm_node
+  in
   Check.((List.length contract_logs = 3) int)
     ~error_msg:"Expected %R logs, got %L" ;
   (* Check that there have been 3 logs with the transfer event topic *)
@@ -3785,9 +4004,7 @@ let test_rpc_getLogs =
       (list (tuple3 string (list string) string)))
     ~error_msg:"Expected logs %R, got %L" ;
   (* Check that a specific block has a log *)
-  let* tx1_receipt =
-    get_transaction_receipt ~full_evm_setup:evm_setup ~tx_hash:tx1
-  in
+  let*@! tx1_receipt = Rpc.get_transaction_receipt ~tx_hash:tx1 evm_node in
   let* tx1_block_logs =
     get_logs
       ~from_block:(Int32.to_string tx1_receipt.blockNumber)
@@ -3797,18 +4014,22 @@ let test_rpc_getLogs =
   Check.((List.length tx1_block_logs = 1) int)
     ~error_msg:"Expected %R logs, got %L" ;
   (* Check no logs after transactions *)
-  let* no_logs_start = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
-  let* new_logs = get_logs ~from_block:(string_of_int no_logs_start) evm_node in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
+  let*@ no_logs_start = Rpc.block_number evm_node in
+  let* new_logs =
+    get_logs ~from_block:(Int32.to_string no_logs_start) evm_node
+  in
   Check.((List.length new_logs = 0) int) ~error_msg:"Expected %R logs, got %L" ;
   unit
 
 let test_tx_pool_replacing_transactions =
-  register_both ~tags:["evm"; "tx_pool"] ~title:"Transactions can be replaced"
-  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
+  register_both
+    ~tags:["evm"; "tx_pool"]
+    ~title:"Transactions can be replaced"
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
   let bob = Eth_account.bootstrap_accounts.(0) in
-  let* bob_nonce = get_transaction_count evm_node bob.address in
+  let*@ bob_nonce = Rpc.get_transaction_count evm_node ~address:bob.address in
   (* nonce: 0, private_key: bootstrappe_account(0), amount: 10; max_fees: 21000*)
   let tx_a =
     "0xf86b80825208825208940000000000000000000000000000000000000000888ac7230489e8000080820a95a05fc733145b2066166e074bc42239a7312b2358f5cbf9ce17bab404abd1dfaff0a0493e763aa933d3eb724d75f9ad6fb4bbffdf3d54568d44d6f70cfcf0a07dc4f8"
@@ -3818,20 +4039,18 @@ let test_tx_pool_replacing_transactions =
     "0xf86b80827530825208940000000000000000000000000000000000000000884563918244f4000080820a96a008410806e7a3c6b403bbfa99d82886e5460921a664410eaea5fe99050c4dc63da031c3eb45ac8a42600b27029d1c910b4c0006f1f435a29f91626964a8cf25da3f"
   in
   (* Send the transactions to the proxy*)
-  let* result = send_raw_transaction evm_node tx_a in
-  let _tx_a_hash = Result.get_ok result in
-  let* result = send_raw_transaction evm_node tx_b in
-  let tx_b_hash = Result.get_ok result in
+  let*@ _tx_a_hash = Rpc.send_raw_transaction ~raw_tx:tx_a evm_node in
+  let*@ tx_b_hash = Rpc.send_raw_transaction ~raw_tx:tx_b evm_node in
   let* receipt =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (wait_for_transaction_receipt ~evm_node ~transaction_hash:tx_b_hash)
-      ()
   in
-  let* new_bob_nonce = get_transaction_count evm_node bob.address in
+  let*@ new_bob_nonce =
+    Rpc.get_transaction_count evm_node ~address:bob.address
+  in
   Check.((receipt.status = true) bool) ~error_msg:"Transaction has failed" ;
   Check.((new_bob_nonce = Int64.(add bob_nonce one)) int64)
     ~error_msg:"Bob has sent more than one transaction" ;
@@ -3842,7 +4061,7 @@ let test_l2_nested_create =
     ~tags:["evm"; "l2_deploy"; "l2_create"; "inter_contract"]
     ~title:"Check L2 nested create"
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* nested_create_address, _tx =
@@ -3860,10 +4079,8 @@ let test_l2_nested_create =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_create sender 1)
-      ()
   in
   let* tx2 =
     let call_create (sender : Eth_account.t) n salt =
@@ -3877,10 +4094,8 @@ let test_l2_nested_create =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_create sender 1 "0x")
-      ()
   in
   let* () = check_tx_succeeded ~endpoint ~tx:tx1 in
   let* () = check_tx_succeeded ~endpoint ~tx:tx2 in
@@ -3904,25 +4119,29 @@ let test_block_hash_regression =
   in
   (* We use a timestamp equal to the next day after genesis.
      The genesis timestamp can be found in tezt/lib_tezos/client.ml *)
-  let* {evm_node; sc_rollup_node; node; client; _} =
+  let* {evm_node; sc_rollup_node; client; _} =
     setup_evm_kernel
       ~config
       ~admin:None
       ~timestamp:(At (Option.get @@ Ptime.of_date (2018, 7, 1)))
+      ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
       protocol
   in
   let txs = read_tx_from_file () |> List.filteri (fun i _ -> i < 3) in
   let raw_txs, _tx_hashes = List.split txs in
   let* _requests, receipt, _hashes =
-    send_n_transactions ~sc_rollup_node ~node ~client ~evm_node raw_txs
+    send_n_transactions ~sc_rollup_node ~client ~evm_node raw_txs
   in
   Regression.capture @@ sf "Block hash: %s" receipt.blockHash ;
   unit
 
 let test_l2_revert_returns_unused_gas =
-  register_both ~tags:["evm"] ~title:"Check L2 revert returns unused gas"
+  register_both
+    ~tags:["evm"]
+    ~title:"Check L2 revert returns unused gas"
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* _revert_address, _tx = deploy ~contract:revert ~sender evm_setup in
@@ -3934,20 +4153,17 @@ let test_l2_revert_returns_unused_gas =
     "0xf8690183010000830186a094d77420f73b4612a7a99dba8c2afd30a1886b03448084c0406226820a96a0869b3a97d2c87d41c22eaeafba2644c276e74267998dff3504d1d2b35fae0e2ba058f0661adcff7d2abd3c6eb4d663e4731c838f6ef15ebb797b88db87c4fee39b"
   in
   let* balance_before = Eth_cli.balance ~account:sender.address ~endpoint in
-  let* result = send_raw_transaction evm_node tx in
-  let transaction_hash = Result.get_ok result in
+  let*@ transaction_hash = Rpc.send_raw_transaction ~raw_tx:tx evm_node in
   let* transaction_receipt =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (wait_for_transaction_receipt ~evm_node ~transaction_hash)
-      ()
   in
   let gas_used = transaction_receipt.gasUsed in
   let* () = check_tx_failed ~endpoint ~tx:transaction_hash in
-  Check.((gas_used < 100000l) int32)
+  Check.((gas_used < 100000L) int64)
     ~error_msg:"Expected gas usage less than %R logs, got %L" ;
   let* balance_after = Eth_cli.balance ~account:sender.address ~endpoint in
   let gas_fee_paid = Wei.(balance_before - balance_after) in
@@ -3962,7 +4178,7 @@ let test_l2_create_collision =
     ~tags:["evm"; "l2_create"; "collision"]
     ~title:"Check L2 create collision"
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* create2_address, _tx = deploy ~contract:create2 ~sender evm_setup in
@@ -3981,34 +4197,20 @@ let test_l2_create_collision =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_create2 sender ~expect_failure:false)
-      ()
   in
 
   let* tx2 =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_create2 sender ~expect_failure:true)
-      ()
   in
 
   let* () = check_tx_succeeded ~tx:tx1 ~endpoint in
-
-  (* Eth-cli would wrap receipt of failed transaction in its own error message.
-      Since we currently don't parse error message from eth-cli,
-      we cannot fetch the tx_hash in this case and would get an empty string as tx_hash for failed transaction.
-      After handling of failed transaction is correctly implemented, the following check would need to be replaced with
-      let* () = check_tx_failed ~tx:tx2 ~endpoint in *)
-  Check.(
-    (tx2 = "")
-      string
-      ~error_msg:"Expected returned transaction hash to be %R but was %L.") ;
-  unit
+  check_tx_failed ~tx:tx2 ~endpoint
 
 let test_l2_intermediate_OOG_call =
   register_both
@@ -4017,7 +4219,7 @@ let test_l2_intermediate_OOG_call =
       "Check that an L2 call to a smart contract with an intermediate call \
        that runs out of gas still succeeds."
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* random_contract_address, _tx =
@@ -4038,10 +4240,8 @@ let test_l2_intermediate_OOG_call =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_oog sender ~expect_failure:false)
-      ()
   in
   check_tx_succeeded ~tx ~endpoint
 
@@ -4050,7 +4250,7 @@ let test_l2_ether_wallet =
     ~tags:["evm"; "l2_call"; "wallet"]
     ~title:"Check ether wallet functions correctly"
   @@ fun ~protocol:_ ~evm_setup ->
-  let {evm_node; sc_rollup_node; node; client; _} = evm_setup in
+  let {evm_node; sc_rollup_node; client; _} = evm_setup in
   let endpoint = Evm_node.endpoint evm_node in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* ether_wallet_address, _tx =
@@ -4064,7 +4264,7 @@ let test_l2_ether_wallet =
         ~value:(Wei.of_eth_int 100)
         ~endpoint
     in
-    wait_for_application ~evm_node ~sc_rollup_node ~node ~client transaction ()
+    wait_for_application ~evm_node ~sc_rollup_node ~client transaction
   in
   let* tx2 =
     let call_withdraw (sender : Eth_account.t) n =
@@ -4078,10 +4278,8 @@ let test_l2_ether_wallet =
     wait_for_application
       ~evm_node
       ~sc_rollup_node
-      ~node
       ~client
       (call_withdraw sender 100)
-      ()
   in
   let* () = check_tx_succeeded ~endpoint ~tx:tx1 in
   let* () = check_tx_succeeded ~endpoint ~tx:tx2 in
@@ -4116,8 +4314,7 @@ let test_keep_alive =
         Evm_node.run ~wait:false ~extra_arguments:["--keep-alive"] evm_node
       in
       let* () =
-        Evm_node.wait_for evm_node "evm_node_retrying_connect.v0"
-        @@ fun _json -> Some ()
+        Evm_node.wait_for evm_node "retrying_connect.v0" @@ fun _json -> Some ()
       in
       (* Restart the rollup node to restore the connection. *)
       let* () = Sc_rollup_node.run sc_rollup_node sc_rollup_address [] in
@@ -4152,19 +4349,929 @@ let test_regression_block_hash_gen =
       ])
     ~title:"Random generation based on block hash and timestamp"
   @@ fun protocol ->
-  let* ({evm_node; sc_rollup_node; node; client; _} as evm_setup) =
-    setup_evm_kernel ~admin:None protocol
+  (* Ok this one is tricky. As far as I understand the test can be
+     flaky because the estimateGas does not provide enough
+     gas. However, all estimateGas are run on the same block but do
+     not provide the same response, as the block number is constant I
+     make the timestamp constant as well to make the test more
+     predictible. I am not sure about the fix. In the worst case it
+     does not change the test semantics. *)
+  let timestamp = Client.(At (Time.of_notation_exn "2020-01-01T00:00:00Z")) in
+  let* ({evm_node; sc_rollup_node; client; _} as evm_setup) =
+    setup_evm_kernel ~admin:None ~timestamp protocol
   in
-  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~node ~client in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
   let sender = Eth_account.bootstrap_accounts.(0) in
   let* _address, _tx = deploy ~contract:block_hash_gen ~sender evm_setup in
   unit
 
+let test_reboot_out_of_ticks =
+  register_proxy
+    ~tags:["evm"; "reboot"; "loop"; "out_of_ticks"]
+    ~title:
+      "Check that the kernel can handle transactions that take too many ticks \
+       for a single run"
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; node; client; _} ->
+  (* Retrieves all the messages and prepare them for the current rollup. *)
+  let txs =
+    read_file (kernel_inputs_path ^ "/loops-out-of-ticks")
+    |> String.trim |> String.split_on_char '\n'
+  in
+  (* The first three transactions are sent in a separate block, to handle any nonce issue. *)
+  let first_block, second_block, third_block, fourth_block =
+    match txs with
+    | faucet1 :: faucet2 :: create :: rem ->
+        ([faucet1], [faucet2], [create], rem)
+    | _ ->
+        failwith
+          "The prepared transactions should contain at least 3 transactions"
+  in
+  let* () =
+    Lwt_list.iter_s
+      (fun block ->
+        let* _requests, _receipt, _hashes =
+          send_n_transactions
+            ~sc_rollup_node
+            ~client
+            ~evm_node
+            ~wait_for_blocks:5
+            block
+        in
+        unit)
+      [first_block; second_block; third_block]
+  in
+  let* total_tick_number_before_expected_reboots =
+    Sc_rollup_node.RPC.call sc_rollup_node
+    @@ Sc_rollup_rpc.get_global_block_total_ticks ()
+  in
+  let* l1_level_before_out_of_ticks = Node.get_level node in
+  let* requests, receipt, _hashes =
+    send_n_transactions
+      ~sc_rollup_node
+      ~client
+      ~evm_node
+      ~wait_for_blocks:5
+      (* By default, it waits for 3 blocks. We need to take into account the
+         blocks before the inclusion which is generally 2. The loops can be a
+         bit long to execute, as such the inclusion test might fail before the
+         execution is over, making it flaky. *)
+      fourth_block
+  in
+  let* total_tick_number_with_expected_reboots =
+    Sc_rollup_node.RPC.call sc_rollup_node
+    @@ Sc_rollup_rpc.get_global_block_total_ticks ()
+  in
+  let*@ block_with_out_of_ticks =
+    Rpc.get_block_by_number
+      ~block:(Format.sprintf "%#lx" receipt.blockNumber)
+      evm_node
+  in
+  (* Check that all the transactions are actually included in the same block,
+     otherwise it wouldn't make sense to continue. *)
+  (match block_with_out_of_ticks.Block.transactions with
+  | Block.Empty -> Test.fail "Expected a non empty block"
+  | Block.Full _ ->
+      Test.fail "Block is supposed to contain only transaction hashes"
+  | Block.Hash hashes ->
+      Check.((List.length hashes = List.length requests) int)
+        ~error_msg:"Expected %R transactions in the resulting block, got %L") ;
+
+  (* Check the number of ticks spent during the period when there should have
+     been a reboot due to out of ticks. There have been a reboot if the number
+     of ticks is not `number of blocks` * `ticks per l1 level`. *)
+  let* l1_level_after_out_of_ticks = Node.get_level node in
+  let number_of_blocks =
+    l1_level_after_out_of_ticks - l1_level_before_out_of_ticks
+  in
+  let ticks_after_expected_reboot =
+    total_tick_number_with_expected_reboots
+    - total_tick_number_before_expected_reboots
+  in
+
+  (* The PVM takes 11G ticks for collecting inputs, 11G for a kernel_run. As such,
+     an L1 level is at least 22G ticks. *)
+  let ticks_per_snapshot =
+    Tezos_protocol_alpha.Protocol.Sc_rollup_wasm.V2_0_0.ticks_per_snapshot
+    |> Z.to_int
+  in
+  let min_ticks_per_l1_level = ticks_per_snapshot * 2 in
+  Check.(
+    (ticks_after_expected_reboot
+    = (min_ticks_per_l1_level * number_of_blocks) + ticks_per_snapshot)
+      int)
+    ~error_msg:
+      "The number of ticks spent during the period should be %R, but got %L, \
+       which implies there have been no reboot, contrary to what was expected." ;
+  unit
+
+let test_l2_timestamp_opcode =
+  let test ~protocol:_ ~evm_setup =
+    let {evm_node; sc_rollup_node; client; _} = evm_setup in
+    let endpoint = Evm_node.endpoint evm_node in
+    let sender = Eth_account.bootstrap_accounts.(0) in
+    let* timestamp_address, _tx =
+      deploy ~contract:timestamp ~sender evm_setup
+    in
+
+    let* set_timestamp_tx =
+      let call_create =
+        Eth_cli.contract_send
+          ~source_private_key:sender.private_key
+          ~endpoint
+          ~abi_label:timestamp.label
+          ~address:timestamp_address
+          ~method_call:(Printf.sprintf "setTimestamp()")
+      in
+      wait_for_application ~evm_node ~sc_rollup_node ~client call_create
+    in
+
+    let* saved_timestamp =
+      Eth_cli.contract_call
+        ~endpoint
+        ~abi_label:timestamp.label
+        ~address:timestamp_address
+        ~method_call:(Printf.sprintf "getSavedTimestamp()")
+        ()
+    in
+    let saved_timestamp = Int64.of_string (String.trim saved_timestamp) in
+
+    (* This call being done after saving the timestamp, it should be higher. *)
+    let* simulated_timestamp =
+      Eth_cli.contract_call
+        ~endpoint
+        ~abi_label:timestamp.label
+        ~address:timestamp_address
+        ~method_call:(Printf.sprintf "getTimestamp()")
+        ()
+    in
+    let simulated_timestamp =
+      Int64.of_string (String.trim simulated_timestamp)
+    in
+
+    let* () = check_tx_succeeded ~endpoint ~tx:set_timestamp_tx in
+    Check.(
+      (saved_timestamp < simulated_timestamp)
+        int64
+        ~error_msg:
+          "Simulated timestamp (%R) should be higher than the one saved from a \
+           previous block (%L)") ;
+    unit
+  in
+  register_both
+    ~tags:["evm"; "timestamp"; "opcode"]
+    ~title:"Check L2 opcode timestamp"
+    test
+
+let test_migrate_proxy_to_sequencer_future =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "rollup_node"; "init"; "migration"; "sequencer"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:
+      "migrate from proxy to sequencer using a sequencer admin contract with a \
+       future timestamp"
+  @@ fun protocol ->
+  let genesis_timestamp =
+    Client.(At (Time.of_notation_exn "2020-01-01T00:00:00Z"))
+  in
+  (* 1s per block, 10 block. *)
+  let activation_timestamp = "2020-01-01T00:00:10Z" in
+  let sequencer_admin = Constant.bootstrap5 in
+  let sequencer_key = Constant.bootstrap4 in
+  let* ({
+          evm_node = proxy_node;
+          sc_rollup_node;
+          client;
+          kernel;
+          sc_rollup_address;
+          l1_contracts;
+          _;
+        } as full_evm_setup) =
+    setup_evm_kernel
+      ~timestamp:genesis_timestamp
+      ~sequencer_admin
+      ~admin:(Some Constant.bootstrap3)
+      protocol
+  in
+  (* Send a transaction in proxy mode. *)
+  let* () =
+    let sender = Eth_account.bootstrap_accounts.(0) in
+    let receiver = Eth_account.bootstrap_accounts.(1) in
+    let* tx = send ~sender ~receiver ~value:Wei.one_eth full_evm_setup in
+    check_tx_succeeded ~endpoint:(Evm_node.endpoint proxy_node) ~tx
+  in
+  (* Send the internal message to add a sequencer on the rollup. *)
+  let sequencer_governance_contract =
+    match
+      Option.bind l1_contracts (fun {sequencer_governance; _} ->
+          sequencer_governance)
+    with
+    | Some contract -> contract
+    | None -> Test.fail "missing sequencer admin contract"
+  in
+  let* () =
+    sequencer_upgrade
+      ~sc_rollup_address
+      ~sequencer_admin:sequencer_admin.alias
+      ~sequencer_governance_contract
+      ~client
+      ~upgrade_to:sequencer_key.alias
+      ~activation_timestamp
+      ~pool_address:Eth_account.bootstrap_accounts.(0).address
+  in
+  let sequencer_node =
+    let mode =
+      Evm_node.Sequencer
+        {
+          initial_kernel = kernel;
+          preimage_dir = Sc_rollup_node.data_dir sc_rollup_node // "wasm_2_0_0";
+          private_rpc_port = Some (Port.fresh ());
+          time_between_blocks = Some Nothing;
+          sequencer = sequencer_key.alias;
+          genesis_timestamp = None;
+          max_blueprints_lag = None;
+          max_blueprints_ahead = None;
+          max_blueprints_catchup = None;
+          catchup_cooldown = None;
+          devmode = true;
+          wallet_dir = Some (Client.base_dir client);
+        }
+    in
+    Evm_node.create ~mode (Sc_rollup_node.endpoint sc_rollup_node)
+  in
+  let* () =
+    repeat 10 (fun () ->
+        let* _ = next_rollup_node_level ~sc_rollup_node ~client in
+        unit)
+  in
+  (* Run the sequencer from the rollup node state. *)
+  let* () =
+    Evm_node.init_from_rollup_node_data_dir
+      ~devmode:true
+      sequencer_node
+      sc_rollup_node
+  in
+  let* () = Evm_node.run sequencer_node in
+  (* Same head after initialisation. *)
+  let* () =
+    check_head_consistency
+      ~left:sequencer_node
+      ~right:proxy_node
+      ~error_msg:"block hash is not equal (sequencer: %L; rollup: %R)"
+      ()
+  in
+  (* Produce a block in sequencer. *)
+  let*@ _ = Rpc.produce_block sequencer_node in
+  let* () =
+    bake_until_sync
+      ~sc_rollup_node
+      ~client
+      ~sequencer:sequencer_node
+      ~proxy:proxy_node
+      ()
+  in
+  (* Same head after first sequencer produced block. *)
+  let* () =
+    check_head_consistency
+      ~left:sequencer_node
+      ~right:proxy_node
+      ~error_msg:"block hash is not equal (sequencer: %L; rollup: %R)"
+      ()
+  in
+
+  (* Send a transaction to sequencer. *)
+  let* () =
+    let sender = Eth_account.bootstrap_accounts.(0) in
+    let receiver = Eth_account.bootstrap_accounts.(1) in
+    let full_evm_setup = {full_evm_setup with evm_node = sequencer_node} in
+    let* tx = send ~sender ~receiver ~value:Wei.one_eth full_evm_setup in
+    check_tx_succeeded ~endpoint:(Evm_node.endpoint sequencer_node) ~tx
+  in
+  let* () =
+    bake_until_sync
+      ~sc_rollup_node
+      ~client
+      ~sequencer:sequencer_node
+      ~proxy:proxy_node
+      ()
+  in
+  (* Same head after sequencer transaction. *)
+  let* () =
+    check_head_consistency
+      ~left:sequencer_node
+      ~right:proxy_node
+      ~error_msg:"block hash is not equal (sequencer: %L; rollup: %R)"
+      ()
+  in
+  unit
+
+let test_migrate_proxy_to_sequencer_past =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "rollup_node"; "init"; "migration"; "sequencer"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:
+      "migrate from proxy to sequencer using a sequencer admin contract with a \
+       past timestamp"
+  @@ fun protocol ->
+  let sequencer_admin = Constant.bootstrap5 in
+  let sequencer_key = Constant.bootstrap4 in
+  let* ({
+          evm_node = proxy_node;
+          sc_rollup_node;
+          client;
+          kernel;
+          sc_rollup_address;
+          l1_contracts;
+          _;
+        } as full_evm_setup) =
+    setup_evm_kernel ~sequencer_admin ~admin:(Some Constant.bootstrap3) protocol
+  in
+  (* Send a transaction in proxy mode. *)
+  let* () =
+    let sender = Eth_account.bootstrap_accounts.(0) in
+    let receiver = Eth_account.bootstrap_accounts.(1) in
+    let* tx = send ~sender ~receiver ~value:Wei.one_eth full_evm_setup in
+    check_tx_succeeded ~endpoint:(Evm_node.endpoint proxy_node) ~tx
+  in
+  (* Send the internal message to add a sequencer on the rollup. *)
+  let sequencer_governance_contract =
+    match
+      Option.bind l1_contracts (fun {sequencer_governance; _} ->
+          sequencer_governance)
+    with
+    | Some contract -> contract
+    | None -> Test.fail "missing sequencer admin contract"
+  in
+  let* () =
+    sequencer_upgrade
+      ~sc_rollup_address
+      ~sequencer_admin:sequencer_admin.alias
+      ~sequencer_governance_contract
+      ~client
+      ~upgrade_to:sequencer_key.alias
+      ~activation_timestamp:"0"
+      ~pool_address:Eth_account.bootstrap_accounts.(0).address
+  in
+  let* () =
+    (* We need to bake 3 blocks, because otherwise the sequencer upgrade event
+       is re-received by the EVM node. This is because `init from rollup node`
+       reads the HEAD context of the rollup node, but the EVM node interacts
+       with the rollup node two blocks in the past. As a consequence, without
+       baking these blocks, the EVM node will virtually handle the sequencer
+       upgrade event twice.
+
+       However, the EVM node does not deal with sequencer event gracefully
+       right now. It works for preventing the old sequencer to produce
+       blueprints, but not for the new sequencer to start producing blueprints.
+
+       This is because of the blueprint deletion mechanism of the kernel.
+       When the sequencer upgrade is applied at the end of stage-1, the
+       pending blueprints are deleted. This means the bluperint currently
+       applied in `apply_blueprint` is deleted, meaning nothing is executed
+       in the stage-2. *)
+    repeat 3 (fun () ->
+        let* _ = next_rollup_node_level ~sc_rollup_node ~client in
+        unit)
+  in
+  let sequencer_node =
+    let mode =
+      Evm_node.Sequencer
+        {
+          initial_kernel = kernel;
+          preimage_dir = Sc_rollup_node.data_dir sc_rollup_node // "wasm_2_0_0";
+          private_rpc_port = Some (Port.fresh ());
+          time_between_blocks = Some Nothing;
+          sequencer = sequencer_key.alias;
+          genesis_timestamp = None;
+          max_blueprints_lag = None;
+          max_blueprints_ahead = None;
+          max_blueprints_catchup = None;
+          catchup_cooldown = None;
+          devmode = true;
+          wallet_dir = Some (Client.base_dir client);
+        }
+    in
+    Evm_node.create ~mode (Sc_rollup_node.endpoint sc_rollup_node)
+  in
+  (* Run the sequencer from the rollup node state. *)
+  let* () =
+    Evm_node.init_from_rollup_node_data_dir
+      ~devmode:true
+      sequencer_node
+      sc_rollup_node
+  in
+  let* () = Evm_node.run sequencer_node in
+  (* Same head after initialisation. *)
+  let* () =
+    check_head_consistency
+      ~left:sequencer_node
+      ~right:proxy_node
+      ~error_msg:"block hash is not equal (sequencer: %L; rollup: %R)"
+      ()
+  in
+
+  (* Produce a block in sequencer. *)
+  let*@ _ = Rpc.produce_block sequencer_node in
+  let* () =
+    bake_until_sync
+      ~sc_rollup_node
+      ~client
+      ~sequencer:sequencer_node
+      ~proxy:proxy_node
+      ()
+  in
+  (* Same head after first sequencer produced block. *)
+  let* () =
+    check_head_consistency
+      ~left:sequencer_node
+      ~right:proxy_node
+      ~error_msg:"block hash is not equal (sequencer: %L; rollup: %R)"
+      ()
+  in
+
+  (* Send a transaction to sequencer. *)
+  let* () =
+    let sender = Eth_account.bootstrap_accounts.(0) in
+    let receiver = Eth_account.bootstrap_accounts.(1) in
+    let full_evm_setup = {full_evm_setup with evm_node = sequencer_node} in
+    let* tx = send ~sender ~receiver ~value:Wei.one_eth full_evm_setup in
+    check_tx_succeeded ~endpoint:(Evm_node.endpoint sequencer_node) ~tx
+  in
+  let* () =
+    bake_until_sync
+      ~sc_rollup_node
+      ~client
+      ~sequencer:sequencer_node
+      ~proxy:proxy_node
+      ()
+  in
+  (* Same head after sequencer transaction. *)
+  let* () =
+    check_head_consistency
+      ~left:sequencer_node
+      ~right:proxy_node
+      ~error_msg:"block hash is not equal (sequencer: %L; rollup: %R)"
+      ()
+  in
+
+  unit
+
+let test_ghostnet_kernel =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "ghostnet"; "version"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_evm_node;
+        Constant.octez_smart_rollup_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.ghostnet_evm_kernel;
+      ])
+    ~title:"Regression test for Ghostnet kernel"
+  @@ fun protocol ->
+  let* {evm_node; _} =
+    setup_evm_kernel
+      ~kernel_installee:Constant.WASM.ghostnet_evm_kernel
+      ~admin:None
+      protocol
+  in
+  let*@ version = Rpc.tez_kernelVersion evm_node in
+  Check.((version = Constant.WASM.ghostnet_evm_commit) string)
+    ~error_msg:"The ghostnet kernel has version %L but constant says %R" ;
+  unit
+
+let test_estimate_gas_out_of_ticks =
+  register_both
+    ~tags:["evm"; "estimate_gas"; "out_of_ticks"; "simulate"]
+    ~title:"estimateGas works with out of ticks"
+  @@ fun ~protocol:_ ~evm_setup:({evm_node; _} as evm_setup) ->
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let* loop_address, _tx = deploy ~contract:loop ~sender evm_setup in
+  (* Call estimateGas with an out of ticks transaction. *)
+  let estimateGas =
+    [
+      ("from", `String sender.address);
+      (* The data payload was retrieved by calling `loop(100000)` and reversed
+         engineer the data field. *)
+      ( "data",
+        `String
+          "0x0b7d796e00000000000000000000000000000000000000000000000000000000000186a0"
+      );
+      ("to", `String loop_address);
+    ]
+  in
+  let*@? {message; code = _; data = _} =
+    Rpc.estimate_gas estimateGas evm_node
+  in
+  Check.(message =~ rex "The transaction would exhaust all the ticks")
+    ~error_msg:"The estimate gas should fail with out of ticks message." ;
+  unit
+
+let test_l2_call_selfdetruct_contract_in_same_transaction =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "l2_call"; "selfdestrcut"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:"Check destruct contract in same transaction can be called"
+  @@ fun protocol ->
+  let* ({evm_node; sc_rollup_node; client; _} as evm_setup) =
+    setup_evm_kernel ~admin:None protocol
+  in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let* _address, _tx = deploy ~contract:call_selfdestruct ~sender evm_setup in
+  unit
+
+let test_call_recursive_contract_estimate_gas =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "l2_call"; "estimate_gas"; "recursive"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:"Check recursive contract gasLimit is high enough"
+  @@ fun protocol ->
+  let* ({endpoint; sc_rollup_node; client; evm_node; _} as evm_setup) =
+    setup_evm_kernel ~admin:None protocol
+  in
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let* recursive_address, _tx = deploy ~contract:recursive ~sender evm_setup in
+  let call () =
+    Eth_cli.contract_send
+      ~source_private_key:sender.private_key
+      ~endpoint
+      ~abi_label:recursive.label
+      ~address:recursive_address
+      ~method_call:"call(50)"
+      ()
+  in
+  let* tx = wait_for_application ~evm_node ~sc_rollup_node ~client call in
+  let* () = check_tx_succeeded ~endpoint ~tx in
+  unit
+
+let test_transaction_exhausting_ticks_is_rejected =
+  register_both
+    ~tags:["evm"; "loop"; "out_of_ticks"; "rejected"]
+    ~title:
+      "Check that the node will reject a transaction that wouldn't fit in a \
+       kernel run."
+    ~minimum_base_fee_per_gas:base_fee_for_hardcoded_tx
+  @@ fun ~protocol:_ ~evm_setup:{evm_node; sc_rollup_node; client; _} ->
+  (* Retrieves all the messages and prepare them for the current rollup. *)
+  let txs =
+    read_file (kernel_inputs_path ^ "/loops-exhaust-ticks")
+    |> String.trim |> String.split_on_char '\n'
+  in
+  (* The first three transactions are sent in a separate block, to handle any nonce issue. *)
+  let first_block, second_block, third_block, loop_out_of_ticks =
+    match txs with
+    | [faucet1; faucet2; create; loop_out_of_ticks] ->
+        ([faucet1], [faucet2], [create], loop_out_of_ticks)
+    | _ -> failwith "The prepared transactions should contain 4 transactions"
+  in
+  let* () =
+    Lwt_list.iter_s
+      (fun block ->
+        let* _requests, _receipt, _hashes =
+          send_n_transactions
+            ~sc_rollup_node
+            ~client
+            ~evm_node
+            ~wait_for_blocks:5
+            block
+        in
+        unit)
+      [first_block; second_block; third_block]
+  in
+  let* result = Rpc.send_raw_transaction ~raw_tx:loop_out_of_ticks evm_node in
+  (match result with
+  | Ok _ -> Test.fail "The transaction should have been rejected by the node"
+  | Error _ -> ()) ;
+  unit
+
+let test_reveal_storage =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "sequencer"; "reveal_storage"]
+    ~title:"Reveal storage"
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+  @@ fun protocol ->
+  (* Start a regular rollup. *)
+  let* {evm_node; sc_rollup_node; client; _} =
+    setup_evm_kernel ~admin:None protocol
+  in
+  let* () =
+    repeat 6 (fun _ -> next_evm_level ~evm_node ~sc_rollup_node ~client)
+  in
+  let*@ first_rollup_head = Rpc.get_block_by_number ~block:"latest" evm_node in
+
+  (* Dump the storage of the smart rollup node and convert it into a RLP file
+     the kernel can read. *)
+  let dump_json = Temp.file "dump.json" in
+  let dump_rlp = Temp.file "dump.rlp" in
+  let* () =
+    Sc_rollup_node.dump_durable_storage ~sc_rollup_node ~dump:dump_json ()
+  in
+  let* () = Evm_node.transform_dump ~dump_json ~dump_rlp in
+
+  (* Get root hash of the storage configuration *)
+  let config_preimages_dir = Temp.dir "config_preimages" in
+  let* {root_hash = configuration_root_hash; _} =
+    prepare_installer_kernel_with_arbitrary_file
+      ~preimages_dir:config_preimages_dir
+      dump_rlp
+  in
+
+  (* Start a new EVM rollup chain, but this time, with a ad-hoc config that
+     allows to duplicate the state of the previous one.
+
+     The only way for this new rollup to see initialized balances is for the
+     duplication process to work. *)
+  let config =
+    `Config
+      Sc_rollup_helpers.Installer_kernel_config.
+        [
+          Reveal
+            {
+              hash = configuration_root_hash;
+              to_ = Durable_storage_path.reveal_config;
+            };
+        ]
+  in
+
+  (* Setup the new rollup, but do not force the installation of the kernel as
+     we need to setup the preimage directory first. *)
+  let* {evm_node; sc_rollup_node; client; _} =
+    setup_evm_kernel
+      ~admin:None
+      ~config
+      ~force_install_kernel:false
+      ~bootstrap_accounts:[||]
+      protocol
+  in
+
+  (* Copy the config preimages directory contents into the preimages directory
+     of the new rollup node. *)
+  let* _ =
+    Lwt_unix.system
+      Format.(
+        sprintf
+          "cp %s/* %s"
+          config_preimages_dir
+          (Sc_rollup_node.data_dir sc_rollup_node // "wasm_2_0_0"))
+  in
+
+  (* Force the installation of the kernel of the new chain *)
+  let* _ = next_evm_level ~evm_node ~client ~sc_rollup_node in
+
+  (* Check the head. We produced one additional head with the bake above. *)
+  let*@ copied_rollup_head =
+    Rpc.get_block_by_number
+      ~block:(first_rollup_head.number |> Int32.to_string)
+      evm_node
+  in
+  Check.((copied_rollup_head.hash = first_rollup_head.hash) string)
+    ~error_msg:"Head should be the same in the copy" ;
+  unit
+
+let call_get_hash ~address ~block_number
+    {sc_rollup_node; client; endpoint; evm_node; _} =
+  let call_get_hash block_number =
+    Eth_cli.contract_call
+      ~endpoint
+      ~abi_label:blockhash.label
+      ~address
+      ~method_call:(Printf.sprintf "getHash(%d)" block_number)
+  in
+  wait_for_application
+    ~evm_node
+    ~sc_rollup_node
+    ~client
+    (call_get_hash block_number)
+
+let test_blockhash_opcode =
+  Protocol.register_test
+    ~__FILE__
+    ~tags:["evm"; "blockhash"; "opcode"]
+    ~uses:(fun _protocol ->
+      [
+        Constant.octez_smart_rollup_node;
+        Constant.octez_evm_node;
+        Constant.smart_rollup_installer;
+        Constant.WASM.evm_kernel;
+      ])
+    ~title:"Check if blockhash opcode returns the actual hash of the block"
+  @@ fun protocol ->
+  let* ({evm_node; sc_rollup_node; client; endpoint; _} as evm_setup) =
+    setup_evm_kernel ~admin:None protocol
+  in
+  let* () =
+    repeat 3 (fun () -> next_evm_level ~evm_node ~client ~sc_rollup_node)
+  in
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let* address, tx = deploy ~contract:blockhash ~sender evm_setup in
+  let* () = check_tx_succeeded ~endpoint ~tx in
+  let* expected_block_hash =
+    let* block = Eth_cli.get_block ~block_id:"2" ~endpoint in
+    return block.hash
+  in
+  (* The client's response is read from stdout, we have to remove the new line
+     symbol. *)
+  let* block_hash =
+    call_get_hash ~address ~block_number:2 evm_setup
+    |> Lwt.map (fun s -> String.sub s 0 (String.length s - 1))
+  in
+  Check.((block_hash = expected_block_hash) string)
+    ~error_msg:
+      "The block hash should be the same when called from an RPC and return by \
+       the BLOCKHASH opcode, got %L, but %R was expected." ;
+  unit
+
+let test_revert_is_correctly_propagated =
+  register_both
+    ~tags:["evm"; "revert"]
+    ~title:"Check that the node propagates reverts reason correctly."
+  @@ fun ~protocol:_ ~evm_setup:({evm_node; _} as evm_setup) ->
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  let* error_address, _tx = deploy ~contract:error ~sender evm_setup in
+  let* data =
+    Eth_cli.encode_method ~abi_label:error.label ~method_:"testRevert(0)"
+  in
+  let* call = Rpc.call ~to_:error_address ~data evm_node in
+  match call with
+  | Ok _ -> Test.fail "Call should have reverted"
+  | Error {data = None; _} ->
+      Test.fail "Call should have reverted with a reason"
+  | Error {data = Some _reason; _} ->
+      (* TODO: #6893
+         eth-cli cannot decode an encoded string using Ethereum format. *)
+      unit
+
+(** Test that the kernel can handle more than 100 withdrawals withdrawals
+    per level, which is currently the limit of outbox messages in the L1. *)
+let test_outbox_size_limit_resilience ~slow =
+  let admin = Constant.bootstrap5 in
+  let commitment_period = 5 and challenge_window = 5 in
+  let slow_str = if slow then "slow" else "fast" in
+  register_proxy
+    ~tags:(["evm"; "withdraw"; "outbox"] @ if slow then [Tag.slow] else [])
+    ~title:(sf "Outbox size limit resilience (%s)" slow_str)
+    ~admin:(Some admin)
+    ~commitment_period
+    ~challenge_window
+  @@ fun ~protocol:_ ~evm_setup ->
+  let {
+    evm_node;
+    sc_rollup_node;
+    client;
+    endpoint;
+    sc_rollup_address;
+    l1_contracts;
+    _;
+  } =
+    evm_setup
+  in
+  (* Deposit tickets to the rollup to perform the withdrawals. *)
+  let* () =
+    let bridge =
+      let l1_contracts = Option.get l1_contracts in
+      l1_contracts.bridge
+    in
+    Client.transfer
+      ~entrypoint:"deposit"
+      ~arg:
+        (sf
+           "Pair %S 0x1074Fd1EC02cbeaa5A90450505cF3B48D834f3EB"
+           sc_rollup_address)
+      ~amount:(Tez.of_int 1000)
+      ~giver:Constant.bootstrap5.public_key_hash
+      ~receiver:bridge
+      ~burn_cap:Tez.one
+      client
+  in
+  let* _ = next_evm_level ~evm_node ~sc_rollup_node ~client in
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  (* Deploy the spam contract. *)
+  let* contract, _tx = deploy ~contract:spam_withdrawal ~sender evm_setup in
+
+  (* Start by giving funds to the contract. This cannot be done in one go
+     because the stupid [eth-cli] doesn't include the transfer in gas
+     estimation, which makes the next call fail. *)
+  let* _tx_give_fund =
+    let give_funds () =
+      Eth_cli.contract_send
+        ~source_private_key:sender.private_key
+        ~endpoint
+        ~abi_label:spam_withdrawal.label
+        ~address:contract
+        ~method_call:"giveFunds()"
+        ~value:(Wei.of_eth_int 200)
+    in
+    wait_for_application ~evm_node ~sc_rollup_node ~client (give_funds ())
+  in
+
+  let* withdrawal_level = Client.level client in
+
+  (* Produce 120 withdrawals by calling the spam entrypoint. *)
+  let* do_withdrawals =
+    let do_withdrawals () =
+      Eth_cli.contract_send
+        ~source_private_key:sender.private_key
+        ~endpoint
+        ~abi_label:spam_withdrawal.label
+        ~address:contract
+        ~method_call:"doWithdrawals(120)"
+        ~value:(Wei.of_eth_int 200)
+    in
+    wait_for_application ~evm_node ~sc_rollup_node ~client (do_withdrawals ())
+  in
+  (* The transaction tries to do more than 100 outbox messages in a Tezos level.
+     If the kernel is not smart about it, it will hard fail and revert its state.
+     Therefore checking if the transaction is a success is a good indicator
+     of the correct behavior. *)
+  let* () = check_tx_succeeded ~endpoint ~tx:do_withdrawals in
+
+  if slow then (
+    (* Execute the first 100 withdrawals *)
+    let* actual_withdrawal_level =
+      find_and_execute_withdrawal
+        ~withdrawal_level
+        ~commitment_period
+        ~challenge_window
+        ~evm_node
+        ~sc_rollup_node
+        ~sc_rollup_address
+        ~client
+    in
+    let* balance =
+      Client.get_balance_for
+        ~account:"tz1WrbkDrzKVqcGXkjw4Qk4fXkjXpAJuNP1j"
+        client
+    in
+    Check.((balance = Tez.of_int 100) Tez.typ)
+      ~error_msg:"Expected balance of %R, got %L" ;
+    (* Execute the next 20 withdrawals *)
+    let* _ =
+      find_and_execute_withdrawal
+        ~withdrawal_level:(actual_withdrawal_level + 1)
+        ~commitment_period
+        ~challenge_window
+        ~evm_node
+        ~sc_rollup_node
+        ~sc_rollup_address
+        ~client
+    in
+    let* balance =
+      Client.get_balance_for
+        ~account:"tz1WrbkDrzKVqcGXkjw4Qk4fXkjXpAJuNP1j"
+        client
+    in
+    Check.((balance = Tez.of_int 120) Tez.typ)
+      ~error_msg:"Expected balance of %R, got %L" ;
+    unit)
+  else unit
+
 let register_evm_node ~protocols =
   test_originate_evm_kernel protocols ;
+  test_kernel_root_hash_originate_absent protocols ;
+  test_kernel_root_hash_originate_present protocols ;
+  test_kernel_root_hash_after_upgrade protocols ;
   test_evm_node_connection protocols ;
   test_consistent_block_hashes protocols ;
   test_rpc_getBalance protocols ;
+  test_rpc_getCode protocols ;
+  test_rpc_blockNumber protocols ;
+  test_rpc_net_version protocols ;
   test_rpc_getBlockByNumber protocols ;
   test_rpc_getBlockByHash protocols ;
   test_rpc_getTransactionCount protocols ;
@@ -4187,7 +5294,6 @@ let register_evm_node ~protocols =
   test_deploy_contract_for_shanghai protocols ;
   test_inject_100_transactions protocols ;
   test_eth_call_storage_contract protocols ;
-  test_eth_call_storage_contract_proxy protocols ;
   test_eth_call_storage_contract_eth_cli protocols ;
   test_eth_call_large protocols ;
   test_preinitialized_evm_kernel protocols ;
@@ -4202,23 +5308,25 @@ let register_evm_node ~protocols =
   test_kernel_upgrade_no_administrator protocols ;
   test_kernel_upgrade_failing_migration protocols ;
   test_kernel_upgrade_version_change protocols ;
+  test_kernel_upgrade_via_governance protocols ;
+  test_kernel_upgrade_via_kernel_security_governance protocols ;
   test_rpc_sendRawTransaction protocols ;
   test_deposit_dailynet protocols ;
+  test_cannot_prepayed_leads_to_no_inclusion protocols ;
+  test_cannot_prepayed_with_delay_leads_to_no_injection protocols ;
   test_rpc_sendRawTransaction_nonce_too_low protocols ;
   test_rpc_sendRawTransaction_nonce_too_high protocols ;
   test_rpc_sendRawTransaction_invalid_chain_id protocols ;
   test_rpc_getTransactionByBlockHashAndIndex protocols ;
   test_rpc_getTransactionByBlockNumberAndIndex protocols ;
-  test_reboot protocols ;
+  test_rpc_getTransactionByHash protocols ;
   test_rpc_getBlockTransactionCountBy protocols ;
   test_rpc_getUncleCountByBlock protocols ;
   test_rpc_getUncleByBlockArgAndIndex protocols ;
   test_simulation_eip2200 protocols ;
-  test_cover_fees protocols ;
   test_rpc_gasPrice protocols ;
   test_rpc_getStorageAt protocols ;
   test_accounts_double_indexing protocols ;
-  test_validation_result protocols ;
   test_rpc_sendRawTransaction_with_consecutive_nonce protocols ;
   test_rpc_sendRawTransaction_not_included protocols ;
   test_originate_evm_kernel_and_dump_pvm_state protocols ;
@@ -4233,8 +5341,24 @@ let register_evm_node ~protocols =
   test_l2_intermediate_OOG_call protocols ;
   test_l2_ether_wallet protocols ;
   test_keep_alive protocols ;
-  test_regression_block_hash_gen protocols
+  test_regression_block_hash_gen protocols ;
+  test_reboot_out_of_ticks protocols ;
+  test_l2_timestamp_opcode protocols ;
+  test_migrate_proxy_to_sequencer_past protocols ;
+  test_migrate_proxy_to_sequencer_future protocols ;
+  test_ghostnet_kernel protocols ;
+  test_estimate_gas_out_of_ticks protocols ;
+  test_l2_call_selfdetruct_contract_in_same_transaction protocols ;
+  test_transaction_exhausting_ticks_is_rejected protocols ;
+  test_reveal_storage protocols ;
+  test_call_recursive_contract_estimate_gas protocols ;
+  test_blockhash_opcode protocols ;
+  test_revert_is_correctly_propagated protocols ;
+  test_outbox_size_limit_resilience ~slow:true protocols ;
+  test_outbox_size_limit_resilience ~slow:false protocols
+
+let protocols = Protocol.all
 
 let () =
-  register_evm_node ~protocols:[Alpha] ;
-  register_evm_migration ~protocols:[Alpha]
+  register_evm_node ~protocols ;
+  register_evm_migration ~protocols

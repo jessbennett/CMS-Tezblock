@@ -180,33 +180,12 @@ Platform developers are also provided reference materials for internal APIs of O
 
 .. toctree::
    :maxdepth: 2
-   :caption: Nairobi Protocol Reference
+   :caption: Protocol Reference Manuals
    :hidden:
 
-   active/protocol
-   active/glossary
-   active/cli-commands
-   active/rpc
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Oxford Protocol Reference
-   :hidden:
-
-   oxford/protocol
-   oxford/glossary
-   oxford/cli-commands
-   oxford/rpc
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Alpha Dev Protocol Reference
-   :hidden:
-
-   alpha/protocol
-   alpha/glossary
-   alpha/cli-commands
-   alpha/rpc
+   Oxford Protocol Reference <active/index>
+   Paris Protocol Reference <paris/index>
+   Alpha Dev Protocol Reference <alpha/index>
 
 .. toctree::
    :maxdepth: 2
@@ -232,8 +211,8 @@ Platform developers are also provided reference materials for internal APIs of O
    :hidden:
 
    protocols/naming
-   protocols/017_nairobi
    protocols/018_oxford
+   protocols/019_paris
    protocols/alpha
    protocols/history
 
@@ -251,14 +230,3 @@ Platform developers are also provided reference materials for internal APIs of O
    developer/encodings
    developer/merkle-proof-encoding-formats
    api/api-inline
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Global doc
-   :hidden:
-
-   global/architecture
-   global/support.rst
-   global/test_networks.rst
-   global/community.rst
-   global/timelock

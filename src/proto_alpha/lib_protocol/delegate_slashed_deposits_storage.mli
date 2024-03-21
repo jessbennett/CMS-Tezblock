@@ -25,27 +25,15 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(** This module maintains the storage related to slashing of delegates for
-   double signing. In particular, it is responsible for maintaining the
-   {!Storage.Slashed_deposits}, {!Storage.Contract.Slashed_deposits}, and
-   {!Storage.Current_cycle_denunciations} tables.
+(** This module handles the slashing of delegates for double signing.
+
+    It is behind the {!Alpha_context} abstraction: some functions are
+    re-exported in {!Alpha_context.Delegate}.
+
+    This module is responsible for maintaining the
+    {!Storage.Contract.Slashed_deposits} table. It also interacts
+    heavily with {!Pending_denunciations_storage}.
 *)
-
-(** Returns true if the given delegate has already been slashed
-    for double baking for the given level. *)
-val already_slashed_for_double_baking :
-  Raw_context.t ->
-  Signature.Public_key_hash.t ->
-  Level_repr.t ->
-  bool tzresult Lwt.t
-
-(** Returns true if the given delegate has already been slashed
-    for double preattesting or double attesting for the given level. *)
-val already_slashed_for_double_attesting :
-  Raw_context.t ->
-  Signature.Public_key_hash.t ->
-  Level_repr.t ->
-  bool tzresult Lwt.t
 
 (** The [reward_and_burn] type embeds amounts involved when slashing a
     delegate for double attesting or double baking. *)
@@ -58,15 +46,9 @@ type punishing_amounts = {
   unstaked : (Cycle_repr.t * reward_and_burn) list;
 }
 
-(** Record in the context that the given delegate is now marked for
-    slashing for the given misbehaviour. If the past and pending
-    slashings for the delegate since the previous cycle exceed a fixed
-    threshold, then this function also records in the context that the
-    delegate is now forbidden from taking part in the consensus
-    process.
-
-    Return the updated context and a boolean indicating whether the
-    delegate is actually forbidden from baking/attesting.
+(** Record in the context that the given delegate is both marked for
+    slashing for the given misbehaviour, and forbidden from taking
+    part in the consensus process (baking/attesting).
 
     [operation_hash] corresponds to the denunciation that prompted
     this punishment. The level argument is the level of the duplicate
@@ -84,15 +66,37 @@ val punish_double_signing :
   Signature.Public_key_hash.t ->
   Level_repr.t ->
   rewarded:Signature.public_key_hash ->
-  (Raw_context.t * bool) tzresult Lwt.t
+  Raw_context.t tzresult Lwt.t
 
-val clear_outdated_slashed_deposits :
-  Raw_context.t -> new_cycle:Cycle_repr.t -> Raw_context.t Lwt.t
+(** Applies pending denunciations in {!Storage.Pending_denunciations}
+    at the end of a cycle. The applicable denunciations are those that
+    point to a misbehavior whose max slashable period is ending.
+    (because [max_slashable_period = 2], the misbehavior must be
+    in the previous cycle).
 
-val apply_and_clear_current_cycle_denunciations :
-  Raw_context.t ->
-  (Raw_context.t
-  * Int_percentage.t Signature.Public_key_hash.Map.t
-  * Receipt_repr.balance_updates)
-  tzresult
-  Lwt.t
+    The denunciations are applied in chronological order of misbehaviour.
+    This function slashes the misbehaving bakers, by a proportion defined
+    in {!Slash_percentage}, and updates the respective
+    {!Storage.Contract.Slashed_deposits}. The applied denunciations are
+    removed from the storage.
+
+    It returns the updated context, and all the balance updates,
+    which includes slashes for the bakers, the stakers, and the rewards
+    for the denouncers.
+*)
+val apply_and_clear_denunciations :
+  Raw_context.t -> (Raw_context.t * Receipt_repr.balance_updates) tzresult Lwt.t
+
+module For_RPC : sig
+  (** [get_estimated_shared_pending_slashed_amount ctxt delegate]
+      returns the estimated shared pending slashed amount of the given [delegate]
+      according to the currently available denunciations. *)
+  val get_estimated_shared_pending_slashed_amount :
+    Raw_context.t -> Signature.public_key_hash -> Tez_repr.t tzresult Lwt.t
+
+  (** [get_estimated_own_pending_slashed_amount ctxt contract]
+      returns the estimated own pending slashed amount of the given [contract]
+      according to the currently available denunciations. *)
+  val get_estimated_own_pending_slashed_amount :
+    Raw_context.t -> Contract_repr.t -> Tez_repr.t tzresult Lwt.t
+end

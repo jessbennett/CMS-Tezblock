@@ -64,14 +64,38 @@ let fetch_dal_config cctxt =
   | Error e -> return_error e
   | Ok dal_config -> return_ok dal_config
 
-let init_cryptobox dal_config (proto_parameters : Dal_plugin.proto_parameters) =
+let init_cryptobox config dal_config
+    (proto_parameters : Dal_plugin.proto_parameters) =
   let open Lwt_result_syntax in
+  (* FIXME https://gitlab.com/tezos/tezos/-/issues/6906
+
+     We should load the verifier SRS by default.
+  *)
+  let prover_srs =
+    match config.Configuration_file.profiles with
+    | Types.Bootstrap -> false
+    | Types.Random_observer -> true
+    | Types.Operator l ->
+        List.exists
+          (function
+            | Types.Attester _ -> false
+            | Producer _ -> true
+            | Observer _ -> true)
+          l
+  in
   let* () =
-    let find_srs_files () = Tezos_base.Dal_srs.find_trusted_setup_files () in
-    Cryptobox.Config.init_dal ~find_srs_files dal_config
+    if prover_srs then
+      let find_srs_files () = Tezos_base.Dal_srs.find_trusted_setup_files () in
+      Cryptobox.Config.init_prover_dal ~find_srs_files dal_config
+    else Cryptobox.Config.init_verifier_dal dal_config
   in
   match Cryptobox.make proto_parameters.cryptobox_parameters with
-  | Ok cryptobox -> return cryptobox
+  | Ok cryptobox ->
+      let shards_proofs_precomputation =
+        if prover_srs then Some (Cryptobox.precompute_shards_proofs cryptobox)
+        else None
+      in
+      return (cryptobox, shards_proofs_precomputation)
   | Error (`Fail msg) -> fail [Cryptobox_initialisation_failed msg]
 
 module Handler = struct
@@ -212,6 +236,40 @@ module Handler = struct
                the message revalidated? *)
             other
 
+  (* Set the profile context once we have the protocol plugin. This is supposed
+     to be called only once. *)
+  let set_profile_context ctxt config proto_parameters =
+    let open Lwt_result_syntax in
+    let*! pctxt_opt = Node_context.load_profile_ctxt ctxt in
+    let pctxt_opt =
+      match pctxt_opt with
+      | None ->
+          Profile_manager.add_profiles
+            Profile_manager.empty
+            proto_parameters
+            (Node_context.get_gs_worker ctxt)
+            config.Configuration_file.profiles
+      | Some pctxt ->
+          let profiles = Profile_manager.get_profiles pctxt in
+          (* The profiles from the loaded context are prioritized over the
+             profiles provided in the config file. *)
+          let merged_profiles =
+            Types.merge_profiles
+              ~lower_prio:config.Configuration_file.profiles
+              ~higher_prio:profiles
+          in
+          Profile_manager.add_profiles
+            Profile_manager.empty
+            proto_parameters
+            (Node_context.get_gs_worker ctxt)
+            merged_profiles
+    in
+    match pctxt_opt with
+    | None -> fail Errors.[Profile_incompatibility]
+    | Some pctxt ->
+        let*! () = Node_context.set_profile_ctxt ctxt pctxt in
+        return_unit
+
   let resolve_plugin_and_set_ready config dal_config ctxt cctxt =
     (* Monitor heads and try resolve the DAL protocol plugin corresponding to
        the protocol of the targeted node. *)
@@ -226,45 +284,39 @@ module Handler = struct
       | Some plugin ->
           let (module Dal_plugin : Dal_plugin.T) = plugin in
           let* proto_parameters = Dal_plugin.get_constants `Main block cctxt in
-          let* cryptobox = init_cryptobox dal_config proto_parameters in
+          (* FIXME: https://gitlab.com/tezos/tezos/-/issues/5743
+
+             Instead of recompute those parameters, they could be stored
+             (for a given cryptobox). *)
+          let* cryptobox, shards_proofs_precomputation =
+            init_cryptobox config dal_config proto_parameters
+          in
           Store.Value_size_hooks.set_share_size
             (Cryptobox.Internal_for_tests.encoded_share_size cryptobox) ;
-          let* () =
-            let* pctxt =
-              let pctxt = Node_context.get_profile_ctxt ctxt in
-              match config.Configuration_file.profiles with
-              | Bootstrap -> return @@ Profile_manager.bootstrap_profile
-              | Random_observer -> (
-                  let slot_index =
-                    Random.int proto_parameters.number_of_slots
-                  in
-                  match
-                    Profile_manager.add_operator_profiles
-                      pctxt
-                      proto_parameters
-                      (Node_context.get_gs_worker ctxt)
-                      [Observer {slot_index}]
-                  with
-                  | None -> fail Errors.[Profile_incompatibility]
-                  | Some pctxt -> return pctxt)
-              | Operator operator_profiles -> (
-                  match
-                    Profile_manager.add_operator_profiles
-                      pctxt
-                      proto_parameters
-                      (Node_context.get_gs_worker ctxt)
-                      operator_profiles
-                  with
-                  | None -> fail Errors.[Profile_incompatibility]
-                  | Some pctxt -> return pctxt)
-            in
-            return @@ Node_context.set_profile_ctxt ctxt pctxt
+          let* () = set_profile_context ctxt config proto_parameters in
+          (* We support at most 64 back-pointers, each of which takes 32 bytes.
+             The cells content itself takes less than 64 bytes. *)
+          let padded_encoded_cell_size = 64 * (32 + 1) in
+          (* A pointer hash is 32 bytes length, but because of the double
+             encoding in Dal_proto_types and then in skip_list_cells_store, we
+             have an extra 4 bytes for encoding the size. *)
+          let encoded_hash_size = 32 + 4 in
+          let* skip_list_cells_store =
+            Skip_list_cells_store.init
+              ~node_store_dir:(Configuration_file.store_path config)
+              ~skip_list_store_dir:"skip_list"
+              ~padded_encoded_cell_size
+              ~encoded_hash_size
+              ~number_of_slots:
+                proto_parameters.cryptobox_parameters.number_of_shards
           in
           let*? () =
             Node_context.set_ready
               ctxt
               plugin
+              skip_list_cells_store
               cryptobox
+              shards_proofs_precomputation
               proto_parameters
               block_header.Block_header.shell.proto_level
           in
@@ -304,15 +356,15 @@ module Handler = struct
 
   (* Monitor heads and store *finalized* published slot headers indexed by block
      hash. A slot header is considered finalized when it is in a block with at
-     least one other block on top of it, as guaranteed by Tenderbake. Note that
-     this means that shard propagation is delayed by one level with respect to
+     least two other blocks on top of it, as guaranteed by Tenderbake. Note that
+     this means that shard propagation is delayed by two levels with respect to
      the publication level of the corresponding slot header. *)
   let new_head ctxt cctxt =
     let open Lwt_result_syntax in
     let handler _stopper (head_hash, (header : Tezos_base.Block_header.t)) =
       match Node_context.get_status ctxt with
       | Starting -> return_unit
-      | Ready ready_ctxt ->
+      | Ready ready_ctxt -> (
           let Node_context.
                 {
                   plugin = (module Plugin);
@@ -320,7 +372,9 @@ module Handler = struct
                   cryptobox;
                   shards_proofs_precomputation = _;
                   plugin_proto;
-                  last_seen_head;
+                  last_processed_level;
+                  skip_list_cells_store;
+                  ongoing_amplifications = _;
                 } =
             ready_ctxt
           in
@@ -339,16 +393,48 @@ module Handler = struct
                head_level
                proto_parameters.attestation_lag) ;
 
-          let process_block block_proto block_level =
+          let process_block block_level =
             let block = `Level block_level in
             let* block_info =
               Plugin.block_info cctxt ~block ~metadata:`Always
             in
-            let*? block_round =
-              let shell_header = Plugin.block_shell_header block_info in
-              Plugin.get_round shell_header.fitness
+            let shell_header = Plugin.block_shell_header block_info in
+            (* TODO: https://gitlab.com/tezos/tezos/-/issues/6036
+               Note that the first processed block is special: in contrast to
+               the general case, as implemented by this function, the plugin was
+               set before processing the block, by
+               [resolve_plugin_and_set_ready], not after processing the
+               block. *)
+            let* () =
+              may_update_plugin
+                cctxt
+                ctxt
+                ~block
+                ~current_proto:plugin_proto
+                ~block_proto:shell_header.proto_level
             in
+            let*? block_round = Plugin.get_round shell_header.fitness in
             let* slot_headers = Plugin.get_published_slot_headers block_info in
+            let* cells_of_level =
+              Plugin.Skip_list.cells_of_level block_info cctxt
+            in
+            let cells_of_level =
+              List.map
+                (fun (hash, cell) ->
+                  ( Dal_proto_types.Skip_list_hash.of_proto
+                      Plugin.Skip_list.hash_encoding
+                      hash,
+                    Dal_proto_types.Skip_list_cell.of_proto
+                      Plugin.Skip_list.cell_encoding
+                      cell ))
+                cells_of_level
+            in
+            let* () =
+              Skip_list_cells_store.insert
+                skip_list_cells_store
+                ~attested_level:head_level
+                cells_of_level
+            in
             let* () =
               Slot_manager.store_slot_headers
                 ~number_of_slots:proto_parameters.number_of_slots
@@ -406,40 +492,39 @@ module Handler = struct
                 (Node_context.get_gs_worker ctxt)
                 committee
             in
+            (* This should be the last modification of this node's (ready) context. *)
+            let*? () =
+              Node_context.update_last_processed_level ctxt ~level:block_level
+            in
             Dal_metrics.layer1_block_finalized ~block_level ;
             Dal_metrics.layer1_block_finalized_round ~block_round ;
             let*! () =
               Event.(emit layer1_node_final_block (block_level, block_round))
             in
-            may_update_plugin
-              cctxt
-              ctxt
-              ~block
-              ~current_proto:plugin_proto
-              ~block_proto
+            return_unit
           in
-          let* () =
-            match last_seen_head with
-            | Some {level = last_head_level; proto}
-              when Int32.(succ last_head_level = head_level) ->
-                if last_head_level > 1l then process_block proto last_head_level
-                else
-                  (* TODO: https://gitlab.com/tezos/tezos/-/issues/6036
-                     [last_head_level = 1] is a special migration block: in
-                     contrast to the general case, as implemented by this
-                     function, the plugin was set before processing the block,
-                     by [resolve_plugin_and_set_ready], not after processing the
-                     block. We do not process the block at level 1. *)
-                  return_unit
-            | _ -> return_unit
-          in
-          let head_info =
-            Node_context.{proto = header.shell.proto_level; level = head_level}
-          in
-          let*? () = Node_context.update_last_seen_head ctxt head_info in
-          return_unit
+          match last_processed_level with
+          (* TODO: https://gitlab.com/tezos/tezos/-/issues/6849
+             Depending on the profile, also process blocks in the past, that is,
+             when [last_processed_level < head_level - 3]. *)
+          | Some last_processed_level
+            when Int32.(sub head_level last_processed_level = 3l) ->
+              (* Then the block at level [last_processed_level + 1] is final
+                 (not only its payload), therefore its DAL attestations are
+                 final. *)
+              process_block (Int32.succ last_processed_level)
+          | None ->
+              (* This is the first time we process a block. *)
+              if head_level > 3l then process_block (Int32.sub head_level 2l)
+              else
+                (* We do not process the block at level 1, as it will not contain DAL
+                   information, and it has no round. *)
+                return_unit
+          | Some _ ->
+              (* This case is unreachable, assuming [Monitor_services.heads] does not
+                 skip levels. *)
+              return_unit)
     in
-
     let*! () = Event.(emit layer1_node_tracking_started ()) in
     (* FIXME: https://gitlab.com/tezos/tezos/-/issues/3517
         If the layer1 node reboots, the rpc stream breaks.*)
@@ -498,15 +583,37 @@ let daemonize handlers =
    return_unit)
   |> lwt_map_error (List.fold_left (fun acc errs -> errs @ acc) [])
 
-let connect_gossipsub_with_p2p gs_worker transport_layer node_store =
+let connect_gossipsub_with_p2p gs_worker transport_layer node_store node_ctxt =
   let open Gossipsub in
   let shards_handler ({shard_store; shards_watcher; _} : Store.node_store) =
     let save_and_notify =
       Store.Shards.save_and_notify shard_store shards_watcher
     in
-    fun Types.Message.{share; _} Types.Message_id.{commitment; shard_index; _} ->
-      Seq.return {Cryptobox.share; index = shard_index}
-      |> save_and_notify commitment |> Errors.to_tzresult
+    fun Types.Message.{share; _}
+        Types.Message_id.{commitment; shard_index; level; slot_index; _} ->
+      let open Lwt_result_syntax in
+      let* () =
+        Seq.return {Cryptobox.share; index = shard_index}
+        |> save_and_notify commitment |> Errors.to_tzresult
+      in
+      match
+        Profile_manager.get_profiles @@ Node_context.get_profile_ctxt node_ctxt
+      with
+      | Operator profile_list
+        when List.exists
+               (function
+                 | Types.Observer {slot_index = index} -> index = slot_index
+                 | _ -> false)
+               profile_list ->
+          Amplificator.amplify
+            shard_store
+            node_store
+            commitment
+            ~published_level:level
+            ~slot_index
+            gs_worker
+            node_ctxt
+      | _ -> return_unit
   in
   Lwt.dont_wait
     (fun () ->
@@ -526,30 +633,15 @@ let resolve points =
        ~default_port:(Configuration_file.default.listen_addr |> snd))
     points
 
-(* This function ensures the persistence of attester profiles
-   to the configuration file at shutdown.
-
-   This is especially important for attesters as the pkh they track
-   is supplied by the baker through `PATCH /profile` API calls.
-   As these profiles are added dynamically at run time, they do not exist
-   in the initial configuration file. Therefore, in order to retain these
-   profiles between restarts, we store them to the configuration file at shutdown. *)
-let store_profiles_finalizer ctxt data_dir =
-  let open Lwt_syntax in
-  Lwt_exit.register_clean_up_callback ~loc:__LOC__ @@ fun _exit_status ->
-  let profiles =
-    Profile_manager.get_profiles (Node_context.get_profile_ctxt ctxt)
+let wait_for_l1_bootstrapped (cctxt : Rpc_context.t) =
+  let open Lwt_result_syntax in
+  let*! () = Event.(emit waiting_l1_node_bootstrapped) () in
+  let* stream, _stop = Monitor_services.bootstrapped cctxt in
+  let*! () =
+    Lwt_stream.iter_s (fun (_hash, _timestamp) -> Lwt.return_unit) stream
   in
-  let* r = Configuration_file.load ~data_dir in
-  match r with
-  | Ok config -> (
-      let* r = Configuration_file.save {config with profiles} in
-      match r with
-      | Ok () -> return_unit
-      | Error e -> Event.(emit failed_to_persist_profiles (profiles, e)))
-  | Error e ->
-      let* () = Event.(emit failed_to_persist_profiles (profiles, e)) in
-      return_unit
+  let*! () = Event.(emit l1_node_bootstrapped) () in
+  return_unit
 
 (* FIXME: https://gitlab.com/tezos/tezos/-/issues/3605
    Improve general architecture, handle L1 disconnection etc
@@ -671,11 +763,8 @@ let run ~data_dir configuration_override =
       cctxt
       metrics_server
   in
-  let (_ : Lwt_exit.clean_up_callback_id) =
-    store_profiles_finalizer ctxt data_dir
-  in
   let* rpc_server = RPC_server.(start config ctxt) in
-  connect_gossipsub_with_p2p gs_worker transport_layer store ;
+  connect_gossipsub_with_p2p gs_worker transport_layer store ctxt ;
   (* activate the p2p instance. *)
   let*! () =
     Gossipsub.Transport_layer.activate ~additional_points:points transport_layer
@@ -685,6 +774,8 @@ let run ~data_dir configuration_override =
   let*! () = Event.(emit rpc_server_is_ready rpc_addr) in
   (* Start collecting stats related to the Gossipsub worker. *)
   Dal_metrics.collect_gossipsub_metrics gs_worker ;
+  (* First wait for the L1 node to be bootstrapped. *)
+  let* () = wait_for_l1_bootstrapped cctxt in
   (* Start daemon to resolve current protocol plugin *)
   let* () =
     daemonize

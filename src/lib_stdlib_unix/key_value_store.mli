@@ -54,16 +54,18 @@ open Error_monad
     containing all read/write values since the file was opened (only the most
     recent value for a given key, of course). *)
 
-(** An abstract representation of a file-based key-value store. *)
-type ('file, 'key, 'value) t
-
 (** A [layout] specifies the layout of a virtual file storing keys of type
     ['key] and values of type ['value], as well as the path to the underlying
     physical file. *)
 type ('key, 'value) layout
 
-(** [layout ?encoded_value_size value_encoding path eq index_of] describes a
-    virtual file layout.
+(** The type of functions to compute the layout of a given file. *)
+type ('file, 'key, 'value) file_layout =
+  root_dir:string -> 'file -> ('key, 'value) layout
+
+(** [layout ?encoded_value_size value_encoding path eq index_of
+    ~number_of_keys_per_file] describes a virtual file layout.
+
     - [encoded_value_size] is the size in bytes of any encoded value.  If
     encoded values have different sizes, the behaviour of the store is
     undefined. If [encoded_value_size] is not given, then the encoded value size
@@ -73,91 +75,122 @@ type ('key, 'value) layout
     - [eq] is an equality function on values.
     - [index_of] gives the index of a given key.
 
-   @raise Invalid_argument if [encoded_value_size=None] and [value_encoding] does not have a fixed length.
- *)
+   @raise Invalid_argument if [encoded_value_size=None] and [value_encoding]
+     does not have a fixed length.
+
+   The user should provide the number of keys stored per file, which should not
+   exceed 4096.
+*)
 val layout :
   ?encoded_value_size:int ->
   encoding:'value Data_encoding.t ->
   filepath:string ->
   eq:('value -> 'value -> bool) ->
   index_of:('key -> int) ->
+  number_of_keys_per_file:int ->
   unit ->
   ('key, 'value) layout
 
-(** [init ~lru_size layout_of] initialises a file-based key-value
-    store. [layout_of file] returns a {!type-layout} for a given virtual file
-    [file]. All the keys/values associated to [file] are stored in a single
-    physical file.
+(** An abstract representation of a file-based key-value store. *)
+type ('file, 'key, 'value) t
+
+(** [init ~lru_size ~root_dir] initialises a file-based key-value store. The
+    [root_dir] is created on disk if it doesn't exist. All the keys/values
+    associated to a file are stored in a single physical file.
 
     [lru_size] is a parameter that represents maximum number of open files. It
     is up to the user of this library to decide this number depending on the
     sizes of the values.
+
+    Internally creates a lockfile and returns an error if a key value store in
+    the same [root_dir] is locked by another process. This lockfile does not
+    prevent concurrent opens by the same process and should be completed by a
+    mutex if necessary.
 *)
 val init :
-  lru_size:int -> ('file -> ('key, 'value) layout) -> ('file, 'key, 'value) t
+  lru_size:int -> root_dir:string -> ('file, 'key, 'value) t tzresult Lwt.t
 
 (** [close kvs] waits until all pending reads and writes are completed
     and closes the key-value store. *)
-val close : ('file, 'key, 'value) t -> unit Lwt.t
+val close : ('file, 'key, 'value) t -> unit tzresult Lwt.t
 
-(** [write_value ?(override=false) t file key value] writes a value in the [key]
-    value store in file [file]. If there is already a written value for this
-    key, then the value will be written if and only if [override] is [true]. *)
+(** [write_value ?(override=false) t file_layout file key value] writes a value in
+    the [key] value store in [file]. If there is already a written
+    value for this key, then the value will be written if and only if [override]
+    is [true]. *)
 val write_value :
   ?override:bool ->
   ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
   'file ->
   'key ->
   'value ->
   unit tzresult Lwt.t
 
-(** [write_values ?(override=false) t seq] writes the sequence [seq]
-    onto the store (see {!val:write_value}). If an error occurs, the
-    first error is returned. This function guarantees that up to the
-    data for which the error occured, the values were stored onto the
-    disk. *)
+(** [write_values ?(override=false) t file_layout seq] writes the sequence [seq] onto
+    the store (see {!val:write_value}). If an error occurs, the first error is
+    returned. This function guarantees that up to the data for which the error
+    occured, the values were stored onto the disk. *)
 val write_values :
   ?override:bool ->
   ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
   ('file * 'key * 'value) Seq.t ->
   unit tzresult Lwt.t
 
-(** [read_value t file key] reads the value associated to [key] in
-    [file] in the store. Fails if no value were attached to this
-    [key]. The value read is the last one that was produced by a
-    successful write. *)
+(** [read_value t file_layout file key] reads the value associated to [key] in the
+    [file] in the store. Fails if no value were attached to this [key]. The
+    value read is the last one that was produced by a successful write. *)
 val read_value :
-  ('file, 'key, 'value) t -> 'file -> 'key -> 'value tzresult Lwt.t
+  ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
+  'file ->
+  'key ->
+  'value tzresult Lwt.t
 
-(** [read_values t keys] produces a sequence of [values] associated to
-    the sequence of [keys]. This function is almost instantaneous
-    since no reads are performed. Reads are done when the caller
-    consumes the values of the sequence returned. *)
+(** [read_values t file_layout keys] produces a sequence of [values] associated to
+    the sequence of [keys]. This function is almost instantaneous since no reads
+    are performed. Reads are done when the caller consumes the values of the
+    sequence returned. *)
 val read_values :
   ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
   ('file * 'key) Seq.t ->
   ('file * 'key * 'value tzresult) Seq_s.t
 
 (** Same as {!read_value} expect that this function returns whether the given
     entry exists without reading it. *)
 val value_exists :
-  ('file, 'key, 'value) t -> 'file -> 'key -> bool tzresult Lwt.t
+  ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
+  'file ->
+  'key ->
+  bool tzresult Lwt.t
 
 (** Same as {!read_values} expect that this function returns whether the given
     entries exist without reading them. *)
 val values_exist :
   ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
   ('file * 'key) Seq.t ->
   ('file * 'key * bool tzresult) Seq_s.t
 
-(** [remove_file t file] removes the corresponding physical file of
+(** [remove_file t file_layout] removes the corresponding physical file of
     [file] from the disk as well as the corresponding keys/values of
     the store. In case of concurrent read/write, this function should
     succeed no matter what. The result of [read/write] depends on
     which function was issued first. For example if the [read] was
     issued before the [remove_file], it will returns the corresponding
     value that was stored, and then the file will be removed. *)
-val remove_file : ('file, 'key, 'value) t -> 'file -> unit tzresult Lwt.t
+val remove_file :
+  ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
+  'file ->
+  unit tzresult Lwt.t
 
 (** This function returns the number of entries for a given file. *)
-val count_values : ('file, 'key, 'value) t -> 'file -> int tzresult Lwt.t
+val count_values :
+  ('file, 'key, 'value) t ->
+  ('file, 'key, 'value) file_layout ->
+  'file ->
+  int tzresult Lwt.t

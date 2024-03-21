@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2022-2024 TriliTech <contact@trili.tech>
-// SPDX-FileCopyrightText: 2023 Functori <contact@functori.com>
+// SPDX-FileCopyrightText: 2023-2024 Functori <contact@functori.com>
 //
 // SPDX-License-Identifier: MIT
 
@@ -19,6 +19,8 @@ use tezos_evm_logging::{log, Level::*};
 use tezos_smart_rollup_storage::StorageError;
 use thiserror::Error;
 
+mod access_record;
+
 pub mod abi;
 pub mod account_storage;
 pub mod handler;
@@ -26,6 +28,8 @@ pub mod precompiles;
 pub mod storage;
 pub mod tick_model_opcodes;
 pub mod transaction;
+pub mod transaction_layer_data;
+pub mod utilities;
 
 pub use evm::Config;
 
@@ -36,6 +40,8 @@ extern crate tezos_smart_rollup_host as host;
 
 use precompiles::PrecompileSet;
 
+use crate::handler::ExtendedExitReason;
+
 #[derive(Error, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableStorageError {
     /// Some runtime error happened while using durable storage
@@ -45,11 +51,6 @@ pub enum DurableStorageError {
     /// resource.
     #[error("Path error: {0:?}")]
     PathError(#[from] host::path::PathError),
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum ArithmeticErrorKind {
-    FeeOverflow,
 }
 
 /// Errors when processing Ethereum transactions
@@ -106,13 +107,19 @@ pub enum EthereumError {
     /// result of a bug in the EvmHandler.
     #[error("Inconsistent EvmHandler state: {0}")]
     InconsistentState(Cow<'static, str>),
-    /// The execution failed because there was an arithmetic overflow or underflow.
-    #[error("A computation provoked an arithmetic error: {0:?}")]
-    ArithmeticError(ArithmeticErrorKind),
     /// The execution failed because it spent more ticks than the one currently
     /// available for the current run.
     #[error("The transaction took more ticks than expected")]
     OutOfTicks,
+    /// gas_limit * gas_price > u64::max
+    #[error("Gas payment overflowed u64::max")]
+    GasPaymentOverflow,
+    /// Converting non-execution fees to gas overflowed u64::max
+    #[error("Gas for fees overflowed u64::max in conversion")]
+    FeesToGasOverflow,
+    /// Underflow of gas limit when subtracting gas for fees
+    #[error("Insufficient gas to cover the non-execution fees")]
+    GasToFeesUnderflow,
 }
 
 /// Execute an Ethereum Transaction
@@ -125,6 +132,10 @@ pub enum EthereumError {
 ///
 /// If the gas limit is given as `None` (there is no gas limit), then there will be no
 /// accounting for gas usage at all. So the gas usage in the return value will be zero.
+// DO NOT RENAME: function name is used during benchmark
+// Never inlined when the kernel is compiled for benchmarks, to ensure the
+// function is visible in the profiling results.
+#[cfg_attr(feature = "benchmark", inline(never))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_transaction<'a, Host>(
     host: &'a mut Host,
@@ -140,13 +151,16 @@ pub fn run_transaction<'a, Host>(
     value: Option<U256>,
     pay_for_gas: bool,
     allocated_ticks: u64,
+    retriable: bool,
+    enable_warm_cold_access: bool,
 ) -> Result<Option<handler::ExecutionOutcome>, EthereumError>
 where
     Host: Runtime,
 {
     fn do_refund(outcome: &handler::ExecutionOutcome, pay_for_gas: bool) -> bool {
         match outcome.reason {
-            ExitReason::Revert(_) => pay_for_gas,
+            ExtendedExitReason::Exit(ExitReason::Revert(_))
+            | ExtendedExitReason::OutOfTicks => pay_for_gas,
             _ => pay_for_gas && outcome.is_success,
         }
     }
@@ -162,26 +176,51 @@ where
         precompiles,
         allocated_ticks,
         effective_gas_price,
+        enable_warm_cold_access,
     );
 
     if (!pay_for_gas)
         || handler.pre_pay_transactions(caller, gas_limit, effective_gas_price)?
     {
         let result = if let Some(address) = address {
-            handler.call_contract(caller, address, value, call_data, gas_limit, false)?
+            handler.call_contract(caller, address, value, call_data, gas_limit, false)
         } else {
             // This is a create-contract transaction
-            handler.create_contract(caller, value, call_data, gas_limit)?
+            handler.create_contract(caller, value, call_data, gas_limit)
         };
 
-        handler.increment_nonce(caller)?;
+        match result {
+            Ok(result) => {
+                if result.reason == ExtendedExitReason::OutOfTicks && retriable {
+                    // The nonce must be incremented before the execution. Details here: https://gitlab.com/tezos/tezos/-/merge_requests/11998.
+                    // In the EVM logic, the nonce is never decremented
+                    // But with the ticks model, if the execution raises an 'out of ticks' error and if the transaction is 'retriable', the nonce must not be incremented
+                    // But we can only know that after the execution, which is why we must decrement the nonce here
+                    handler.decrement_nonce(caller)?;
+                }
 
-        if do_refund(&result, pay_for_gas) {
-            let unused_gas = gas_limit.map(|gl| gl - result.gas_used);
-            handler.repay_gas(caller, unused_gas, effective_gas_price)?;
+                if do_refund(&result, pay_for_gas) {
+                    // In case of `OutOfTicks` and the transaction can be
+                    // retried, the gas is entirely refunded as it will be
+                    // repaid in the next attempt
+                    if result.reason == ExtendedExitReason::OutOfTicks && retriable {
+                        log!(
+                            handler.borrow_host(),
+                            Debug,
+                            "The transaction exhausted the ticks of the \
+                             current reboot and is retriable: refunding all the gas."
+                        );
+                        handler.repay_gas(caller, gas_limit, effective_gas_price)?;
+                    } else {
+                        let unused_gas = gas_limit.map(|gl| gl - result.gas_used);
+                        handler.repay_gas(caller, unused_gas, effective_gas_price)?;
+                    }
+                }
+
+                Ok(Some(result))
+            }
+            Err(e) => Err(e),
         }
-
-        Ok(Some(result))
     } else {
         // caller was unable to pay for the gas limit
         if pay_for_gas {
@@ -207,6 +246,7 @@ mod test {
     use primitive_types::{H160, H256};
     use std::str::FromStr;
     use std::vec;
+    use tezos_ethereum::block::BlockFees;
     use tezos_ethereum::tx_common::EthereumTransactionCommon;
     use tezos_smart_rollup_mock::MockHost;
 
@@ -248,6 +288,31 @@ mod test {
         }
     }
 
+    fn set_storage(
+        host: &mut MockHost,
+        evm_account_storage: &mut EthereumAccountStorage,
+        address: &H160,
+        index: &H256,
+        value: &H256,
+    ) {
+        let mut account = evm_account_storage
+            .get_or_create(host, &account_path(address).unwrap())
+            .unwrap();
+        account.set_storage(host, index, value).unwrap();
+    }
+
+    fn get_storage(
+        host: &mut MockHost,
+        evm_account_storage: &mut EthereumAccountStorage,
+        address: &H160,
+        index: &H256,
+    ) -> H256 {
+        let account = evm_account_storage
+            .get_or_create(host, &account_path(address).unwrap())
+            .unwrap();
+        account.get_storage(host, index).unwrap()
+    }
+
     fn get_balance(
         host: &mut MockHost,
         evm_account_storage: &mut EthereumAccountStorage,
@@ -271,6 +336,17 @@ mod test {
         account.set_code(host, code).unwrap();
     }
 
+    fn get_code(
+        host: &mut MockHost,
+        evm_account_storage: &mut EthereumAccountStorage,
+        address: &H160,
+    ) -> Vec<u8> {
+        let account = evm_account_storage
+            .get_or_create(host, &account_path(address).unwrap())
+            .unwrap();
+        account.code(host).unwrap()
+    }
+
     fn bump_nonce(
         host: &mut impl Runtime,
         evm_account_storage: &mut EthereumAccountStorage,
@@ -281,8 +357,24 @@ mod test {
         account.increment_nonce(host).unwrap();
     }
 
+    fn get_nonce(
+        host: &mut MockHost,
+        evm_account_storage: &mut EthereumAccountStorage,
+        address: &H160,
+    ) -> u64 {
+        let account = evm_account_storage
+            .get_or_create(host, &account_path(address).unwrap())
+            .unwrap();
+        account.nonce(host).unwrap()
+    }
+
     fn dummy_first_block() -> BlockConstants {
-        BlockConstants::first_block(U256::zero(), U256::one(), U256::from(21000))
+        let block_fees = BlockFees::new(
+            U256::one(),
+            U256::from(12345),
+            U256::from(2_000_000_000_000u64),
+        );
+        BlockConstants::first_block(U256::zero(), U256::one(), block_fees)
     }
 
     #[test]
@@ -326,12 +418,14 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: config.gas_transaction_call,
             is_success: false,
-            reason: ExitReason::Error(ExitError::OutOfFund),
+            reason: ExitReason::Error(ExitError::OutOfFund).into(),
             new_address: None,
             logs: vec![],
             result: None,
@@ -391,12 +485,14 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: config.gas_transaction_call,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![]),
@@ -450,12 +546,14 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: 0,
             is_success: false,
-            reason: ExitReason::Error(ExitError::OutOfFund),
+            reason: ExitReason::Error(ExitError::OutOfFund).into(),
             new_address: None,
             logs: vec![],
             result: None,
@@ -506,6 +604,8 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let new_address =
@@ -540,6 +640,8 @@ mod test {
             Some(U256::zero()),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
         assert!(result2.is_ok(), "execution should have succeeded");
         let result = result2.unwrap();
@@ -568,6 +670,8 @@ mod test {
             Some(U256::zero()),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
         assert!(result3.is_ok(), "execution should have succeeded");
         let result = result3.unwrap();
@@ -595,6 +699,8 @@ mod test {
             Some(U256::zero()),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
         assert!(result2.is_ok(), "execution should have succeeded");
         let result = result2.unwrap();
@@ -649,6 +755,8 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -699,12 +807,14 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: 0,
             is_success: false,
-            reason: ExitReason::Error(ExitError::DesignatedInvalid),
+            reason: ExitReason::Error(ExitError::DesignatedInvalid).into(),
             new_address: None,
             logs: vec![],
             result: None,
@@ -752,6 +862,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000; // base cost
@@ -760,7 +872,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![]),
@@ -898,6 +1010,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -907,7 +1021,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Returned),
+            reason: ExitReason::Succeed(ExitSucceed::Returned).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![]),
@@ -961,6 +1075,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -970,7 +1086,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: false,
-            reason: ExitReason::Revert(ExitRevert::Reverted),
+            reason: ExitReason::Revert(ExitRevert::Reverted).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![]),
@@ -1023,13 +1139,15 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         // Assert
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: 0,
             is_success: false,
-            reason: ExitReason::Error(ExitError::DesignatedInvalid),
+            reason: ExitReason::Error(ExitError::DesignatedInvalid).into(),
             new_address: None,
             logs: vec![],
             result: None,
@@ -1080,12 +1198,14 @@ mod test {
             Some(U256::from(100)),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: 0,
             is_success: false,
-            reason: ExitReason::Error(ExitError::DesignatedInvalid),
+            reason: ExitReason::Error(ExitError::DesignatedInvalid).into(),
             new_address: None,
             logs: vec![],
             result: None,
@@ -1138,6 +1258,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -1148,7 +1270,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Returned),
+            reason: ExitReason::Succeed(ExitSucceed::Returned).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![1u8; 32]),
@@ -1198,6 +1320,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         // Assert
@@ -1207,7 +1331,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: 25676,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Returned),
+            reason: ExitReason::Succeed(ExitSucceed::Returned).into(),
             new_address: None,
             logs: vec![],
             result: Some(hex::decode(expected_address).unwrap()),
@@ -1310,6 +1434,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         // Assert
@@ -1388,6 +1514,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -1400,7 +1528,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![]),
@@ -1481,6 +1609,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -1493,7 +1623,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             // No logs were produced
             logs: vec![],
@@ -1596,6 +1726,8 @@ mod test {
             None,
             true,
             1_000_000_000,
+            false,
+            false,
         );
 
         let log_record1 = Log {
@@ -1616,7 +1748,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             logs: vec![log_record1, log_record2],
             result: Some(vec![]),
@@ -1708,6 +1840,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let log_record1 = Log {
@@ -1722,7 +1856,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             logs: vec![log_record1],
             result: Some(vec![]),
@@ -1809,18 +1943,20 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
         let expected_gas = 21000 // base cost
-        + 30124; // execution gas cost (taken at face value from tests)
+        + 5124; // execution gas cost (taken at face value from tests)
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Stopped),
+            reason: ExitReason::Succeed(ExitSucceed::Stopped).into(),
             new_address: None,
             logs: vec![],
             result: Some(vec![]),
             withdrawals: vec![],
-            estimated_ticks_used: 23749485,
+            estimated_ticks_used: 4049485,
         }));
 
         assert_eq!(result, expected_result);
@@ -1927,17 +2063,19 @@ mod test {
             None,
             true,
             10_000_000_000,
+            false,
+            false,
         );
 
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: all_the_gas,
             is_success: false,
-            reason: ExitReason::Error(ExitError::InvalidCode(Opcode::INVALID)),
+            reason: ExitReason::Error(ExitError::InvalidCode(Opcode::INVALID)).into(),
             new_address: None,
             logs: vec![],
             result: None,
             withdrawals: vec![],
-            estimated_ticks_used: 9512509485,
+            estimated_ticks_used: 9742809485,
         }));
 
         assert_eq!(result, expected_result);
@@ -1954,7 +2092,7 @@ mod test {
             U256::from(1_000_000)
         );
         assert_eq!(account.code(&mock_runtime).unwrap(), selfdestructing_code);
-        assert_eq!(account.nonce(&mock_runtime).unwrap(), U256::one());
+        assert_eq!(account.nonce(&mock_runtime).unwrap(), 1);
 
         assert_eq!(
             get_balance(&mut mock_runtime, &mut evm_account_storage, &caller),
@@ -1969,13 +2107,17 @@ mod test {
         let chain_id = U256::from(42);
         let mut chain_id_bytes = [0u8; 32];
         chain_id.to_big_endian(&mut chain_id_bytes);
-        let block =
-            BlockConstants::first_block(U256::zero(), chain_id, U256::from(21000));
+        let block_fees = BlockFees::new(
+            U256::zero(),
+            U256::from(54321),
+            U256::from(2_000_000_000_000u64),
+        );
+        let block = BlockConstants::first_block(U256::zero(), chain_id, block_fees);
         let precompiles = precompiles::precompile_set::<MockHost>();
         let mut evm_account_storage = init_evm_account_storage().unwrap();
         let target = H160::from_low_u64_be(117u64);
         let caller = H160::from_low_u64_be(118u64);
-        let gas_price = U256::from(21000);
+        let gas_price = U256::from(12345);
         let code = vec![
             Opcode::CHAINID.as_u8(), // cost 2
             Opcode::PUSH1.as_u8(),   // push ost, cost 3
@@ -2015,6 +2157,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -2024,7 +2168,7 @@ mod test {
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
             is_success: true,
-            reason: ExitReason::Succeed(ExitSucceed::Returned),
+            reason: ExitReason::Succeed(ExitSucceed::Returned).into(),
             new_address: None,
             logs: vec![],
             result: Some(chain_id_bytes.into()),
@@ -2041,8 +2185,12 @@ mod test {
         let base_fee_per_gas = U256::from(23000);
         let mut base_fee_per_gas_bytes = [0u8; 32];
         base_fee_per_gas.to_big_endian(&mut base_fee_per_gas_bytes);
-        let block =
-            BlockConstants::first_block(U256::zero(), U256::one(), base_fee_per_gas);
+        let block_fees = BlockFees::new(
+            U256::zero(),
+            base_fee_per_gas,
+            U256::from(2_000_000_000_000u64),
+        );
+        let block = BlockConstants::first_block(U256::zero(), U256::one(), block_fees);
         let precompiles = precompiles::precompile_set::<MockHost>();
         let mut evm_account_storage = init_evm_account_storage().unwrap();
         let target = H160::from_low_u64_be(117u64);
@@ -2087,6 +2235,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_gas = 21000 // base cost
@@ -2095,7 +2245,7 @@ mod test {
         // Assert
         let expected_result = Ok(Some(ExecutionOutcome {
             gas_used: expected_gas,
-            reason: ExitReason::Succeed(ExitSucceed::Returned),
+            reason: ExitReason::Succeed(ExitSucceed::Returned).into(),
             is_success: true,
             new_address: None,
             logs: vec![],
@@ -2164,6 +2314,8 @@ mod test {
             Some(U256::from(100)),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let expected_result = Err(EthereumError::EthereumAccountError(
@@ -2213,6 +2365,8 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let result = unwrap_outcome!(result);
@@ -2222,7 +2376,8 @@ mod test {
         + 32000 // create base cost
         + 1220 // transaction data cost
         + 12600 // code deposit cost
-        + 42; // init cost
+        + 42 // init cost
+        + 4; // extra cost (EIP-3860)
 
         assert_eq!(expected_gas, result.gas_used);
     }
@@ -2267,6 +2422,8 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let result = unwrap_outcome!(&result, false);
@@ -2275,7 +2432,8 @@ mod test {
         let expected_gas = 21000 // base cost
         + 32000 // create cost
         + 32 * CONFIG.gas_transaction_non_zero_data // transaction data cost
-        + 3; // init cost
+        + 3 // init cost
+        + 2; // extra cost (EIP-3860)
 
         assert_eq!(expected_gas, result.gas_used);
     }
@@ -2285,10 +2443,12 @@ mod test {
         // Arrange
         let mut mock_runtime = MockHost::default();
         let base_fee_per_gas = U256::from(23000);
-        let mut base_fee_per_gas_bytes = [0u8; 32];
-        base_fee_per_gas.to_big_endian(&mut base_fee_per_gas_bytes);
-        let block =
-            BlockConstants::first_block(U256::zero(), U256::one(), base_fee_per_gas);
+        let block_fees = BlockFees::new(
+            U256::one(),
+            base_fee_per_gas,
+            U256::from(2_000_000_000_000u64),
+        );
+        let block = BlockConstants::first_block(U256::zero(), U256::one(), block_fees);
         let precompiles = precompiles::precompile_set::<MockHost>();
         let mut evm_account_storage = init_evm_account_storage().unwrap();
         let target = H160::from_low_u64_be(117u64);
@@ -2328,6 +2488,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         // Assert
@@ -2344,10 +2506,12 @@ mod test {
         // Arrange
         let mut mock_runtime = MockHost::default();
         let base_fee_per_gas = U256::from(23000);
-        let mut base_fee_per_gas_bytes = [0u8; 32];
-        base_fee_per_gas.to_big_endian(&mut base_fee_per_gas_bytes);
-        let block =
-            BlockConstants::first_block(U256::zero(), U256::one(), base_fee_per_gas);
+        let block_fees = BlockFees::new(
+            U256::one(),
+            base_fee_per_gas,
+            U256::from(2_000_000_000_000u64),
+        );
+        let block = BlockConstants::first_block(U256::zero(), U256::one(), block_fees);
         let precompiles = precompiles::precompile_set::<MockHost>();
         let mut evm_account_storage = init_evm_account_storage().unwrap();
         let target = H160::from_low_u64_be(117u64);
@@ -2387,6 +2551,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         // Assert
@@ -2400,9 +2566,12 @@ mod test {
 
     fn first_block() -> BlockConstants {
         let base_fee_per_gas = U256::from(23000);
-        let mut base_fee_per_gas_bytes = [0u8; 32];
-        base_fee_per_gas.to_big_endian(&mut base_fee_per_gas_bytes);
-        BlockConstants::first_block(U256::zero(), U256::one(), base_fee_per_gas)
+        let block_fees = BlockFees::new(
+            base_fee_per_gas,
+            base_fee_per_gas,
+            U256::from(2_000_000_000_000u64),
+        );
+        BlockConstants::first_block(U256::zero(), U256::one(), block_fees)
     }
 
     fn deploy(
@@ -2440,6 +2609,8 @@ mod test {
             None,
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         )
     }
 
@@ -2453,7 +2624,9 @@ mod test {
         // Assert
         let result = unwrap_outcome!(&result, false);
         assert_eq!(
-            ExitReason::Error(ExitError::InvalidCode(Opcode(0xef))),
+            ExtendedExitReason::Exit(ExitReason::Error(ExitError::InvalidCode(Opcode(
+                0xef
+            )))),
             result.reason
         );
     }
@@ -2478,7 +2651,10 @@ mod test {
 
         // Assert
         let result = unwrap_outcome!(&result);
-        assert_eq!(ExitReason::Succeed(ExitSucceed::Returned), result.reason);
+        assert_eq!(
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Returned)),
+            result.reason
+        );
     }
 
     // Test case from https://eips.ethereum.org/EIPS/eip-684
@@ -2539,13 +2715,221 @@ mod test {
             None,
             true,
             10_000_000_000,
+            false,
+            false,
         );
 
         let result = unwrap_outcome!(&result, false);
         match &result.reason {
-            ExitReason::Error(ExitError::CreateCollision) => (),
+            ExtendedExitReason::Exit(ExitReason::Error(ExitError::CreateCollision)) => (),
             exit_error => panic!(
                 "ExitReason: {:?}. Expect ExitReason::Error(ExitError::CreateCollision)",
+                exit_error
+            ),
+        }
+    }
+
+    // Caller nonce is bumped at each contract creation
+    #[test]
+    fn test_caller_nonce_after_create() {
+        let mut mock_runtime = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller =
+            H160::from_str("0xd0bBEc6D2c628b7e2E6D5556daA14a5181b604C5").unwrap();
+
+        let contract_address =
+            H160::from_str("0x7658771dc6af74a3d2f8499d349ff9c1a0df8826").unwrap();
+
+        let sub_contract =
+            H160::from_str("0x6697a027694475d9f64c97566698c24cff8f17e7").unwrap();
+
+        set_balance(
+            &mut mock_runtime,
+            &mut evm_account_storage,
+            &caller,
+            10000000.into(),
+        );
+
+        // init_code is the input to deploy the following contract.
+        // This contract tries to create a contract at the sub_contract, the creation within the creation will fail
+        // But the creation will success
+        // PUSH5 0x6001600155
+        // PUSH1 0
+        // MSTORE
+        // PUSH1 5
+        // PUSH1 27
+        // PUSH1 0
+        // CREATE
+        let init_code = hex::decode("6460016001556000526005601b6000f0")
+            .expect("Failed to decode call data");
+
+        let gas_limit = 300_000;
+        let gas_price = U256::from(1);
+
+        // Test contract nonce before creation
+        let contract = EthereumAccount::from_address(&contract_address).unwrap();
+        let original_contract_nonce = contract.nonce(&mock_runtime).unwrap_or_default();
+
+        assert_eq!(0, original_contract_nonce);
+
+        // Test the nonce of the sub contract that will be created within contract creation
+        let sub_contract_account = EthereumAccount::from_address(&sub_contract).unwrap();
+        let original_sub_nonce = sub_contract_account
+            .nonce(&mock_runtime)
+            .unwrap_or_default();
+
+        assert_eq!(0, original_sub_nonce);
+
+        let result_init = run_transaction(
+            &mut mock_runtime,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            None,
+            caller,
+            init_code,
+            Some(gas_limit),
+            gas_price,
+            None,
+            true,
+            10_000_000_000,
+            false,
+            false,
+        );
+
+        let result_init = unwrap_outcome!(&result_init, true);
+
+        match &result_init.reason {
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)) => {
+                let contract = EthereumAccount::from_address(&contract_address).unwrap();
+                let caller_nonce = contract.nonce(&mock_runtime).unwrap_or_default();
+                // Check that even if the contract fails to create another contract (due to a collision),
+                // the nonce of contract_address is still bumped
+                assert_eq!(caller_nonce, 2);
+
+                // The sub contract has been created at 0xd807115ef18e7e9b8e54188b4e9ef514277a0740 and
+                // its nonce is incremented to 1
+                let sub_contract_created =
+                    EthereumAccount::from_address(&sub_contract).unwrap();
+                let sub_contract_nonce = sub_contract_created
+                    .nonce(&mock_runtime)
+                    .unwrap_or_default();
+                assert_eq!(sub_contract_nonce, 1);
+            }
+            exit_error => panic!(
+                "ExitReason: {:?}. Expect ExitReason::Succeed(ExitSucceed::Stopped)",
+                exit_error
+            ),
+        }
+    }
+
+    // This test is the same as test_caller_nonce_after_create but with a collision
+    // The nonce of the caller 'contract' should still be incremented
+    #[test]
+    fn test_caller_nonce_after_create_collision() {
+        let mut mock_runtime = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller =
+            H160::from_str("0xd0bBEc6D2c628b7e2E6D5556daA14a5181b604C5").unwrap();
+
+        let sub_contract =
+            H160::from_str("0xd807115ef18e7e9b8e54188b4e9ef514277a0740").unwrap();
+
+        let contract_address =
+            H160::from_str("0x7658771dc6af74a3d2f8499d349ff9c1a0df8826").unwrap();
+
+        set_balance(
+            &mut mock_runtime,
+            &mut evm_account_storage,
+            &caller,
+            10000000.into(),
+        );
+
+        // Set the code of sub_contract to set up a collision
+        set_account_code(
+            &mut mock_runtime,
+            &mut evm_account_storage,
+            &sub_contract,
+            hex::decode("B0B0FACE")
+                .expect("Failed to decode contract code")
+                .as_slice(),
+        );
+
+        // init_code is the input to deploy the following contract.
+        // This contract tries to create a contract at the sub_contract, the creation within the creation will fail
+        // But the creation will success
+        // PUSH5 0x6001600155
+        // PUSH1 0
+        // MSTORE
+        // PUSH1 5
+        // PUSH1 27
+        // PUSH1 0
+        // CREATE
+        let init_code = hex::decode("6460016001556000526005601b6000f0")
+            .expect("Failed to decode call data");
+
+        let gas_limit = 300_000;
+        let gas_price = U256::from(1);
+
+        // Test contract nonce before creation
+        let contract = EthereumAccount::from_address(&contract_address).unwrap();
+        let original_contract_nonce = contract.nonce(&mock_runtime).unwrap_or_default();
+
+        assert_eq!(0, original_contract_nonce);
+
+        // Test the nonce of the sub contract that will be created within contract creation
+        let sub_contract_account = EthereumAccount::from_address(&sub_contract).unwrap();
+        let original_sub_nonce = sub_contract_account
+            .nonce(&mock_runtime)
+            .unwrap_or_default();
+
+        assert_eq!(0, original_sub_nonce);
+
+        let result_init = run_transaction(
+            &mut mock_runtime,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            None,
+            caller,
+            init_code,
+            Some(gas_limit),
+            gas_price,
+            None,
+            true,
+            10_000_000_000,
+            false,
+            false,
+        );
+
+        let result_init = unwrap_outcome!(&result_init, true);
+
+        match &result_init.reason {
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)) => {
+                // Check that even if the contract fails to create another contract (due to a collision),
+                // the nonce of contract_address is still bumped
+                let contract = EthereumAccount::from_address(&contract_address).unwrap();
+                let caller_nonce = contract.nonce(&mock_runtime).unwrap_or_default();
+                assert_eq!(caller_nonce, 2);
+
+                // The sub contract has a collision, so its nonce should not change
+                let sub_contract_created =
+                    EthereumAccount::from_address(&sub_contract).unwrap();
+                let sub_contract_nonce = sub_contract_created
+                    .nonce(&mock_runtime)
+                    .unwrap_or_default();
+                assert_eq!(sub_contract_nonce, original_sub_nonce);
+            }
+            exit_error => panic!(
+                "ExitReason: {:?}. Expect ExitReason::Succeed(ExitSucceed::Stopped)",
                 exit_error
             ),
         }
@@ -2602,11 +2986,13 @@ mod test {
             None,
             true,
             10_000_000_000,
+            false,
+            false,
         );
 
         let result = unwrap_outcome!(&result, false);
         match &result.reason {
-            ExitReason::Error(ExitError::CreateCollision) => (),
+            ExtendedExitReason::Exit(ExitReason::Error(ExitError::CreateCollision)) => (),
             exit_error => panic!(
                 "ExitReason: {:?}. Expect ExitReason::Error(ExitError::CreateCollision)",
                 exit_error
@@ -2647,6 +3033,8 @@ mod test {
             Some(transaction_value),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let result = unwrap_outcome!(result);
@@ -2654,7 +3042,7 @@ mod test {
         let address = new_address.unwrap();
         let smart_contract = EthereumAccount::from_address(&address).unwrap();
 
-        assert_eq!(smart_contract.nonce(&host).unwrap(), U256::one())
+        assert_eq!(smart_contract.nonce(&host).unwrap(), 1)
     }
 
     #[test]
@@ -2681,7 +3069,10 @@ mod test {
             U256::from(10000),
         );
 
-        let code = hex::decode("74600c60005566602060406000f060205260076039f36000526015600b620186a0f060005500").unwrap();
+        let code = hex::decode(
+            "74600c60005566602060406000f060205260076039f36000526015600b620186a0f060005500",
+        )
+        .unwrap();
         set_account_code(&mut host, &mut evm_account_storage, &callee, &code);
 
         let result = run_transaction(
@@ -2698,6 +3089,8 @@ mod test {
             Some(U256::zero()),
             true,
             DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
         );
 
         let path = account_path(&caller).unwrap();
@@ -2709,10 +3102,676 @@ mod test {
         let callee_nonce = account.nonce(&host).unwrap();
 
         assert_eq!(
-            ExitReason::Succeed(ExitSucceed::Stopped),
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)),
             result.unwrap().unwrap().reason,
         );
-        assert_eq!(callee_nonce, U256::zero());
-        assert_eq!(caller_nonce, U256::one());
+        assert_eq!(callee_nonce, 0);
+        assert_eq!(caller_nonce, 1);
+    }
+
+    #[test]
+    fn nested_create_check_nonce_start_at_one() {
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller = H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+
+        // 6295...bf8f is the address that caller will create
+        let callee = H160::from_str("6295ee1b4f6dd65047762f924ecd367c17eabf8f").unwrap();
+
+        // a426...2701 is the address that callee will create if its nonce is at 0
+        let should_not_create: H160 =
+            H160::from_str("0xa42676447b7cedfa5fde894d1d3df24aab362701").unwrap();
+
+        // 64e2...bba6 is the address that callee will create if its nonce is at 1
+        let should_create =
+            H160::from_str("0x64e2ebd6405af8cb348aec519084d3fff42ebba6").unwrap();
+
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &caller,
+            U256::from(1000000000),
+        );
+
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &callee,
+            U256::from(10000),
+        );
+
+        // This code creates a contract that stores 0x12 in the slot 0 of the storage
+        let code = vec![
+            Opcode::PUSH5.as_u8(),
+            0x60,
+            0x12,
+            0x60,
+            0x00,
+            0x55,
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::MSTORE.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x05,
+            Opcode::PUSH1.as_u8(),
+            0x1b,
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::CREATE.as_u8(),
+        ];
+
+        // We create a contract that creates a contract
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            None,
+            caller,
+            code,
+            Some(20000000),
+            U256::one(),
+            Some(U256::zero()),
+            true,
+            DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
+        );
+
+        // Get info on contract that should not be created
+        let path = account_path(&should_not_create).unwrap();
+        let account = evm_account_storage.get_or_create(&host, &path).unwrap();
+        let nonce_of_should_not_create = account.nonce(&host).unwrap();
+        let storage_of_should_not_create = account
+            .get_storage(&host, &H256::zero())
+            .unwrap_or_default();
+
+        // Get info on contract that should be created
+        let path = account_path(&should_create).unwrap();
+        let account = evm_account_storage.get_or_create(&host, &path).unwrap();
+        let nonce_of_should_create = account.nonce(&host).unwrap();
+        let storage_of_should_create = account
+            .get_storage(&host, &H256::zero())
+            .unwrap_or_default();
+
+        let exec_result = unwrap_outcome!(result, true);
+        assert_eq!(
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)),
+            exec_result.reason,
+        );
+        assert_eq!(
+            nonce_of_should_not_create, 0,
+            "Nonce of the contract that should not be created is not 0"
+        );
+        assert_eq!(
+            storage_of_should_not_create,
+            H256::zero(),
+            "Storage of the contract that should not be created is not 0"
+        );
+        assert_eq!(
+            nonce_of_should_create, 1,
+            "Nonce of the contract that should be created is not 1"
+        );
+        assert_eq!(
+            storage_of_should_create,
+            H256::from_low_u64_be(0x12),
+            "Storage of the contract that should be created is not 0x12"
+        );
+    }
+
+    fn out_of_tick_scenario(
+        retriable: bool,
+    ) -> (
+        MockHost,
+        Result<Option<ExecutionOutcome>, EthereumError>,
+        EthereumAccount,
+        U256,
+        u64,
+    ) {
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+        let callee = None;
+        let caller = H160::from_low_u64_be(117);
+        let transaction_value = U256::from(0);
+        let call_data: Vec<u8> = hex::decode(ERC20_CONTRACT_INITIALISATION).unwrap();
+
+        // gas_limit estimated using remix on shanghai network (1,631,430)
+        // plus a 50% margin for gas accounting discrepancies
+        let gas_limit = 2_400_000;
+        let gas_price = U256::from(21000);
+
+        // the test is not to check that account can prepay,
+        // so we can choose the balance depending on set gas limit
+        let initial_balance = gas_price
+            .saturating_mul(gas_limit.into())
+            .saturating_mul(U256::from(2));
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &caller,
+            initial_balance,
+        );
+
+        let path = account_path(&caller).unwrap();
+        let account = evm_account_storage.get_or_create(&host, &path).unwrap();
+        let initial_caller_nonce = account.nonce(&host).unwrap();
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            callee,
+            caller,
+            call_data,
+            Some(gas_limit),
+            gas_price,
+            Some(transaction_value),
+            true,
+            10_000,
+            retriable,
+            false,
+        );
+
+        (host, result, account, initial_balance, initial_caller_nonce)
+    }
+
+    #[test]
+    fn transaction_has_no_impact_if_retriable() {
+        let (host, result, caller, initial_caller_balance, initial_caller_nonce) =
+            out_of_tick_scenario(true);
+        let caller_balance = caller.balance(&host).unwrap();
+        let caller_nonce = caller.nonce(&host).unwrap();
+
+        assert_eq!(
+            ExtendedExitReason::OutOfTicks,
+            result.unwrap().unwrap().reason,
+            "Contract creation was expected to fail and run out of ticks: \n"
+        );
+        assert_eq!(
+            initial_caller_balance, caller_balance,
+            "Balance shouldn't have changed as gas should have been repaid"
+        );
+        assert_eq!(
+            initial_caller_nonce, caller_nonce,
+            "Nonce shouldn't have changed"
+        )
+    }
+
+    #[test]
+    fn non_retriable_transaction_pays_for_exhausted_ticks() {
+        let (host, result, caller, initial_caller_balance, initial_caller_nonce) =
+            out_of_tick_scenario(false);
+        let caller_balance = caller.balance(&host).unwrap();
+        let caller_nonce = caller.nonce(&host).unwrap();
+
+        assert_eq!(
+            ExtendedExitReason::OutOfTicks,
+            result.unwrap().unwrap().reason,
+            "Contract creation was expected to fail and run out of ticks: \n"
+        );
+        assert_ne!(
+            initial_caller_balance, caller_balance,
+            "Gas was not deducted from the caller account"
+        );
+        assert_eq!(
+            initial_caller_nonce + 1,
+            caller_nonce,
+            "Nonce should have been incremented"
+        )
+    }
+
+    // If runned locally, use:
+    // RUST_MIN_STACK=<value> cargo test -p evm-kernel --features testing
+    // with <value> set to 104857600 or something similar in size.
+    // Multiple recursive call and stopping when storage 0 is equal to 1024 (will succeed)
+    #[test]
+    fn multiple_call_all_the_way_to_1024() {
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller = H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+
+        let contract_address =
+            H160::from_str("7335dfb20cdcd40881235a54d61cb1152d771f4d").unwrap();
+
+        // This contract calls itself until its storage slot 0 is 1024 (reach the limit of the stack but not reverting calltoodeep)
+        let contract_code: Vec<u8> = vec![
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::SLOAD.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::PUSH2.as_u8(),
+            0x04, // 0x0400 = 1024
+            0x00,
+            Opcode::EQ.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x22,
+            Opcode::JUMPI.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x01,
+            Opcode::ADD.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::SSTORE.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::DUP1.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::ADDRESS.as_u8(),
+            Opcode::GAS.as_u8(),
+            Opcode::CALL.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x22,
+            Opcode::JUMPI.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::REVERT.as_u8(),
+            Opcode::JUMPDEST.as_u8(),
+            Opcode::STOP.as_u8(),
+        ];
+
+        set_account_code(
+            &mut host,
+            &mut evm_account_storage,
+            &contract_address,
+            &contract_code,
+        );
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            Some(contract_address),
+            caller,
+            vec![],
+            // gas limit comes from GeneralStateTests/stRevertTest/LoopCallsDepthThenRevert3.json
+            Some(9214364837600034817),
+            U256::one(),
+            None,
+            false,
+            u64::MAX,
+            false,
+            false,
+        );
+
+        unwrap_outcome!(result, true);
+    }
+
+    // If runned locally, use:
+    // RUST_MIN_STACK=<value> cargo test -p evm-kernel --features testing
+    // with <value> set to 104857600 or something similar in size.
+    // This test is the same as `multiple_call_all_the_way_to_1024` but instead of stopping
+    // at 1024 we stop at 1025 (this should fail)
+    #[test]
+    fn multiple_call_fails_right_after_1024() {
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller = H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+
+        let contract_address =
+            H160::from_str("7335dfb20cdcd40881235a54d61cb1152d771f4d").unwrap();
+
+        // This contract calls itself until its storage slot 0 is 1025 (reach the limit of the stack and revert)
+        let contract_code: Vec<u8> = vec![
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::SLOAD.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::PUSH2.as_u8(),
+            0x04, // 0x0401 = 1025
+            0x01,
+            Opcode::EQ.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x22,
+            Opcode::JUMPI.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x01,
+            Opcode::ADD.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::SSTORE.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::DUP1.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::DUP1.as_u8(),
+            Opcode::ADDRESS.as_u8(),
+            Opcode::GAS.as_u8(),
+            Opcode::CALL.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x22,
+            Opcode::JUMPI.as_u8(),
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::PUSH1.as_u8(),
+            0x00,
+            Opcode::REVERT.as_u8(),
+            Opcode::JUMPDEST.as_u8(),
+            Opcode::STOP.as_u8(),
+        ];
+
+        set_account_code(
+            &mut host,
+            &mut evm_account_storage,
+            &contract_address,
+            &contract_code,
+        );
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            Some(contract_address),
+            caller,
+            vec![],
+            Some(9214364837600034817), // gas limit comes from GeneralStateTests/stRevertTest/LoopCallsDepthThenRevert3.json
+            U256::one(),
+            None,
+            false,
+            u64::MAX,
+            false,
+            false,
+        );
+
+        unwrap_outcome!(result, false);
+    }
+
+    // If runned locally, use:
+    // RUST_MIN_STACK=<value> cargo test -p evm-kernel --features testing
+    // with <value> set to 104857600 or something similar in size.
+    #[test]
+    fn call_too_deep_not_revert() {
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller = H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+
+        let internal_address =
+            H160::from_str("6cb631a210b05eab95b1f0b0cc83be18789bc479").unwrap();
+
+        let code = hex::decode("3060025560206000600039602060006000f000").unwrap(); // Creates an infinity of contract
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            None,
+            caller,
+            code,
+            Some(u64::MAX),
+            U256::one(),
+            None,
+            false,
+            u64::MAX,
+            false,
+            false,
+        );
+
+        let internal_address_nonce =
+            get_nonce(&mut host, &mut evm_account_storage, &internal_address);
+        let caller_nonce = get_nonce(&mut host, &mut evm_account_storage, &caller);
+
+        assert_eq!(
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)),
+            result.unwrap().unwrap().reason,
+        );
+
+        assert_eq!(caller_nonce, 1);
+        assert_eq!(internal_address_nonce, 2);
+    }
+
+    #[test]
+    fn exceed_max_create_init_code_size_fails() {
+        // Test is taken from:
+        // ethereum/tests/GeneralStateTests/Shanghai/stEIP3860-limitmeterinitcode/createInitCodeSizeLimit.json
+        // with the second data which is invalid (size wise)
+        // The test was a bit tweaked so that the called contract transfer 1 WEI to the called contract.
+
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let address_1 =
+            H160::from_str("000000000000000000000000000000000000c0de").unwrap();
+        let address_2 =
+            H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+        let address_3 =
+            H160::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+
+        bump_nonce(&mut host, &mut evm_account_storage, &address_1);
+        bump_nonce(&mut host, &mut evm_account_storage, &address_2);
+        bump_nonce(&mut host, &mut evm_account_storage, &address_3);
+
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &address_2,
+            U256::from(200000000),
+        );
+
+        set_balance(&mut host, &mut evm_account_storage, &address_3, U256::one());
+
+        let code_1 = hex::decode(
+            "69600a80600080396000f360b01b6000908152355a90600080f0905a9003600a5560005500",
+        )
+        .unwrap();
+        let code_3 =
+            hex::decode("600035600052600080366000600161c0de62989680f16000556001805500")
+                .unwrap();
+
+        set_account_code(&mut host, &mut evm_account_storage, &address_1, &code_1);
+        set_account_code(&mut host, &mut evm_account_storage, &address_3, &code_3);
+
+        // Invalid initcode size = 49153 bytes (max allowed is 49152)
+        let call_data = hex::decode(
+            "000000000000000000000000000000000000000000000000000000000000c001",
+        )
+        .unwrap();
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            Some(address_3),
+            address_2,
+            call_data,
+            Some(15000000),
+            U256::from(10),
+            None,
+            true,
+            DUMMY_ALLOCATED_TICKS * 100,
+            false,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        // The internal call should have failed but not the initial one.
+        // Second contract tried to transfer one WEI to the second contract but
+        // the changes have been rollbacked since there was a CreateContractLimit
+        // error.
+
+        let balance_1 = get_balance(&mut host, &mut evm_account_storage, &address_1);
+        let balance_3 = get_balance(&mut host, &mut evm_account_storage, &address_3);
+
+        assert_eq!(balance_1, U256::zero());
+        assert_eq!(balance_3, U256::one());
+
+        // With call data: 0x000000000000000000000000000000000000000000000000000000000000c001
+        // 0x5f6baaeb5b7c97725f84d1569c4abc85135f4716 should be the generated address,
+        // we check that it does not exist.
+
+        let address_unknown =
+            H160::from_str("5f6baaeb5b7c97725f84d1569c4abc85135f4716").unwrap();
+
+        let balance_unknwown =
+            get_balance(&mut host, &mut evm_account_storage, &address_unknown);
+        let nonce_unknown =
+            get_nonce(&mut host, &mut evm_account_storage, &address_unknown);
+        let code_unknown =
+            get_code(&mut host, &mut evm_account_storage, &address_unknown);
+
+        assert_eq!(balance_unknwown, U256::zero());
+        assert_eq!(nonce_unknown, 0);
+        assert!(code_unknown.is_empty());
+
+        // The initial call succeeds
+        assert_eq!(
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)),
+            result.reason
+        )
+    }
+
+    #[test]
+    fn storage_is_cleared_before_contract_creation() {
+        // Test is taken from:
+        // ethereum/tests/GeneralStateTests/Shanghai/stSStoreTest/InitCollision.json
+        // with the second data.
+
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let address_1 =
+            H160::from_str("6295ee1b4f6dd65047762f924ecd367c17eabf8f").unwrap();
+        let address_2 =
+            H160::from_str("7b9f5332c245e5c60923427eeb34e5adfba6470e").unwrap();
+        let caller = H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+
+        let one = H256::from_low_u64_be(0x01);
+
+        set_balance(
+            &mut host,
+            &mut evm_account_storage,
+            &caller,
+            U256::from(1000000000000u64),
+        );
+
+        set_storage(&mut host, &mut evm_account_storage, &address_1, &one, &one);
+        set_storage(&mut host, &mut evm_account_storage, &address_2, &one, &one);
+
+        // {  (seq   (CREATE2 0 0 (lll (seq (SSTORE 1 0) (SSTORE 1 1) ) 0) 0) (STOP) ) }
+        let call_data =
+            hex::decode("6000600b80601360003960006000f5500000fe6000600155600160015500")
+                .unwrap();
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            None,
+            caller,
+            call_data,
+            Some(200000),
+            U256::from(10),
+            None,
+            true,
+            DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        let nonce_1 = get_nonce(&mut host, &mut evm_account_storage, &address_1);
+        let nonce_2 = get_nonce(&mut host, &mut evm_account_storage, &address_2);
+
+        // Nonce is at 2, because the contract is originated and start at 1 (EIP-161)
+        // and it internally creates an other contract in its initialisation code, so
+        // the nonce is 2.
+        assert_eq!(nonce_1, 2);
+        assert_eq!(nonce_2, 1);
+
+        let storage_1 =
+            get_storage(&mut host, &mut evm_account_storage, &address_1, &one);
+        let storage_2 =
+            get_storage(&mut host, &mut evm_account_storage, &address_2, &one);
+
+        // storage was set but is cleared on contract creation
+        assert_eq!(storage_1, H256::zero());
+        // storage was set during initialisation code when CREATE2 is called
+        assert_eq!(storage_2, one);
+
+        // The initial call succeeds
+        assert_eq!(
+            ExtendedExitReason::Exit(ExitReason::Succeed(ExitSucceed::Stopped)),
+            result.reason
+        )
+    }
+
+    #[test]
+    fn nonce_bump_before_tx() {
+        let mut host = MockHost::default();
+        let block = dummy_first_block();
+        let precompiles = precompiles::precompile_set::<MockHost>();
+        let mut evm_account_storage = init_evm_account_storage().unwrap();
+
+        let caller = H160::from_str("a94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+        let callee = H160::from_str("b94f5374fce5edbc8e2a8697c15331677e6ebf0b").unwrap();
+
+        let code = hex::decode("323f60005260206000f3").unwrap(); // RETURN (EXTCODEHASH (ORIGIN))
+
+        set_account_code(&mut host, &mut evm_account_storage, &callee, &code);
+
+        let result = run_transaction(
+            &mut host,
+            &block,
+            &mut evm_account_storage,
+            &precompiles,
+            CONFIG,
+            Some(callee),
+            caller,
+            vec![],
+            None,
+            U256::one(),
+            None,
+            false,
+            DUMMY_ALLOCATED_TICKS,
+            false,
+            false,
+        );
+
+        // The origin address is empty but when you start a transaction the nonce is bump
+        // so the EXTCODEHASH return the following value (https://eips.ethereum.org/EIPS/eip-1052).
+        // If the nonce isn't bump before the transaction the return value is 0.
+
+        let return_expected = hex::decode(
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        )
+        .unwrap();
+
+        assert_eq!(result.unwrap().unwrap().result.unwrap(), return_expected);
     }
 }

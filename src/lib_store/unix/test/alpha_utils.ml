@@ -375,22 +375,12 @@ let protocol_param_key = ["protocol_parameters"]
 let check_constants_consistency constants =
   let open Lwt_result_syntax in
   let open Constants_parametric_repr in
-  let {blocks_per_cycle; blocks_per_commitment; blocks_per_stake_snapshot; _} =
-    constants
-  in
+  let {blocks_per_cycle; blocks_per_commitment; _} = constants in
   let* () =
     Error_monad.unless (blocks_per_commitment <= blocks_per_cycle) (fun () ->
         failwith
           "Inconsistent constants : blocks per commitment must be less than \
            blocks per cycle")
-  in
-  let* () =
-    Error_monad.unless
-      (blocks_per_cycle >= blocks_per_stake_snapshot)
-      (fun () ->
-        failwith
-          "Inconsistent constants : blocks per cycle must be superior than \
-           blocks per stake snapshot")
   in
   return_unit
 
@@ -717,6 +707,10 @@ let apply_and_store chain_store ?(synchronous_merge = true) ?policy
         let*! () = Block_store.await_merging block_store in
         let* _ = Store.Chain.set_head chain_store b in
         let*! () = Block_store.await_merging block_store in
+        let context_index =
+          Store.context_index (Store.Chain.global_store chain_store)
+        in
+        let*! () = Context_ops.wait_gc_completion context_index in
         (match Block_store.get_merge_status block_store with
         | Merge_failed err -> Assert.fail_msg "%a" pp_print_trace err
         | Running | Not_running -> ()) ;

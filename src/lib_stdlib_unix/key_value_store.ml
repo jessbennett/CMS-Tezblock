@@ -150,17 +150,48 @@ let () =
       | Decoding_failed {filepath; index} -> Some (filepath, index) | _ -> None)
     (fun (filepath, index) -> Decoding_failed {filepath; index})
 
+module Events = struct
+  include Internal_event.Simple
+
+  let section = ["key value store"]
+
+  let warn_non_opened_file_descriptor =
+    declare_0
+      ~section
+      ~name:"bad_file_descriptor"
+      ~level:Warning
+      ~msg:
+        "Trying to unlock/close a non-open file descriptor, is the file \
+         already closed?\n"
+      ()
+end
+
 type ('key, 'value) layout = {
   encoding : 'value Data_encoding.t;
   eq : 'value -> 'value -> bool;
   index_of : 'key -> int;
   filepath : string;
   value_size : int;
+  number_of_keys_per_file : int;
 }
+
+(* The bitset of each file takes 4096 bytes. Because the bitset is
+   actually a byte set, it means that the maximum number of keys is
+   bounded by this size. We could optimize this to store `8` times
+   more keys in the future or also increase the size of the
+   bitset. *)
+let max_number_of_keys_per_file = 4096
+
+(* TODO: https://gitlab.com/tezos/tezos/-/issues/6033
+   For now the bitset is a byte set...
+   With a true bitset, we'd have [max_number_of_keys_per_file/8].
+   Should be ok in practice since an atomic read/write on Linux is 4KiB.
+*)
+let bitset_size = max_number_of_keys_per_file
 
 (** The module [Files] handles writing and reading into memory-mapped files. A
     virtual file is backed by a physical file and a key is just an index (from 0
-    to [max_number_of_keys - 1]). As values within a file have a fixed size, the
+    to [max_number_of_keys_per_file - 1]). As values within a file have a fixed size, the
     index encodes the position of the associated value within the physical file.
 
     This module basically implements the key-value store, by grouping sets of
@@ -204,20 +235,6 @@ end = struct
 
     let hash = Hashtbl.hash
   end)
-
-  (* The bitset of each file takes 4096 bytes. Because the bitset is
-     actually a byte set, it means that the maximum number of keys is
-     bounded by this size. We could optimize this to store `8` times
-     more keys in the future or also increase the size of the
-     bitset. *)
-  let max_number_of_keys = 4096
-
-  (* TODO: https://gitlab.com/tezos/tezos/-/issues/6033
-     For now the bitset is a byte set...
-     With a true bitset, we'd have [max_number_of_keys/8].
-     Should be ok in practice since an atomic read/write on Linux is 4KiB.
-  *)
-  let bitset_size = max_number_of_keys
 
   (* The following cache allows to cache in memory values that were
      accessed recently. There is one cache per file opened. *)
@@ -373,8 +390,9 @@ end = struct
 
   (* The 'n'th byte of the bitset indicates whether a value is stored or not. *)
   let key_exists handle index =
-    if handle.bitset.{index} = '\000' then `Not_found
-    else if handle.bitset.{index} = '\001' then `Found
+    let bit = handle.bitset.{index} in
+    if bit = '\000' then `Not_found
+    else if bit = '\001' then `Found
     else `Corrupted
 
   (* This computation relies on the fact that the size of all the
@@ -692,13 +710,18 @@ end = struct
 
   (* This function aims to be used when a write action is performed on
      a file that does not exist yet. *)
-  let initialize_file files last_actions lru filename value_size =
+  let initialize_file files last_actions lru layout =
     let open Lwt_syntax in
-    let* lru_node = add_lru files last_actions lru filename in
+    let* lru_node = add_lru files last_actions lru layout.filepath in
     let* fd =
-      Lwt_unix.openfile filename [O_RDWR; O_CREAT; O_EXCL; O_CLOEXEC] 0o660
+      Lwt_unix.openfile
+        layout.filepath
+        [O_RDWR; O_CREAT; O_EXCL; O_CLOEXEC]
+        0o660
     in
-    let total_size = bitset_size + (max_number_of_keys * value_size) in
+    let total_size =
+      bitset_size + (layout.number_of_keys_per_file * layout.value_size)
+    in
     let* () = Lwt_unix.ftruncate fd total_size in
     let unix_fd = Lwt_unix.unix_file_descr fd in
     let bitset =
@@ -724,8 +747,7 @@ end = struct
     let open Lwt_syntax in
     let* b = Lwt_unix.file_exists layout.filepath in
     if b then load_file files last_actions lru layout.filepath
-    else
-      initialize_file files last_actions lru layout.filepath layout.value_size
+    else initialize_file files last_actions lru layout
 
   let read {files; last_actions; lru; closed} layout key =
     let open Lwt_syntax in
@@ -854,82 +876,192 @@ end = struct
       return_ok ()
 end
 
+let layout ?encoded_value_size ~encoding ~filepath ~eq ~index_of
+    ~number_of_keys_per_file () =
+  if number_of_keys_per_file > max_number_of_keys_per_file then
+    invalid_arg
+    @@ Format.sprintf
+         "Key_value_store.layout: cannot have more than %d keys per file. \
+          Given %d."
+         max_number_of_keys_per_file
+         number_of_keys_per_file ;
+  match encoded_value_size with
+  | Some value_size ->
+      {filepath; eq; encoding; index_of; value_size; number_of_keys_per_file}
+  | None -> (
+      match Data_encoding.classify encoding with
+      | `Fixed value_size ->
+          {
+            filepath;
+            eq;
+            encoding;
+            index_of;
+            value_size;
+            number_of_keys_per_file;
+          }
+      | `Dynamic | `Variable ->
+          invalid_arg
+            "Key_value_store.layout: encoding does not have fixed size")
+
 (* Main data-structure of the store.
 
    Each physical file may have a different layout.
 *)
 type ('file, 'key, 'value) t = {
-  layout_of : 'file -> ('key, 'value) layout;
   files : 'value Files.t;
+  root_dir : string;
+  lockfile : Lwt_unix.file_descr;
 }
 
-let layout ?encoded_value_size ~encoding ~filepath ~eq ~index_of () =
-  match encoded_value_size with
-  | Some value_size -> {filepath; eq; encoding; index_of; value_size}
-  | None -> (
-      match Data_encoding.classify encoding with
-      | `Fixed value_size -> {filepath; eq; encoding; index_of; value_size}
-      | `Dynamic | `Variable ->
-          invalid_arg
-            "Key_value_store.layout: encoding does not have fixed size")
+type ('file, 'key, 'value) file_layout =
+  root_dir:string -> 'file -> ('key, 'value) layout
 
-let init ~lru_size layout_of =
-  let files = Files.init ~lru_size in
-  {layout_of; files}
+let with_lockfile_lock fn f =
+  let open Lwt_result_syntax in
+  let* fd =
+    Lwt.catch
+      (fun () ->
+        let*! fd =
+          Lwt_unix.openfile fn [Unix.O_CLOEXEC; O_CREAT; O_RDWR] 0o644
+        in
+        Lwt.return_ok fd)
+      (function
+        | Unix.Unix_error (unix_code, caller, arg) ->
+            tzfail
+              (Lwt_utils_unix.Io_error {action = `Open; unix_code; caller; arg})
+        | exn -> Lwt.reraise exn)
+  in
+  Lwt.catch
+    (fun () ->
+      (* Fails if the lockfile is already taken by another process *)
+      let*! () = Lwt_unix.lockf fd F_TLOCK 0 in
+      f fd)
+    (function
+      | Unix.Unix_error (unix_code, caller, arg) ->
+          let* () =
+            Lwt.catch
+              (fun () ->
+                let*! () = Lwt_unix.close fd in
+                return_unit)
+              (function
+                | Unix.Unix_error (unix_code, caller, arg) ->
+                    tzfail
+                      (Lwt_utils_unix.Io_error
+                         {action = `Close; unix_code; caller; arg})
+                | exn -> Lwt.reraise exn)
+          in
+          tzfail
+            (Lwt_utils_unix.Io_error {action = `Lock; unix_code; caller; arg})
+      | exn -> Lwt.reraise exn)
 
-let close {files; _} = Files.close files
+let lockfile_unlock fd =
+  let open Lwt_result_syntax in
+  let* () =
+    Lwt.catch
+      (fun () ->
+        let*! () = Lwt_unix.lockf fd Unix.F_ULOCK 0 in
+        return_unit)
+      (function
+        | Unix.Unix_error (Unix.EBADF, _, _) ->
+            let*! () = Events.(emit warn_non_opened_file_descriptor ()) in
+            return_unit
+        | Unix.Unix_error (unix_code, caller, arg) ->
+            tzfail
+              (Lwt_utils_unix.Io_error {action = `Lock; unix_code; caller; arg})
+        | exn -> Lwt.reraise exn)
+  in
+  Lwt.catch
+    (fun () ->
+      let*! () = Lwt_unix.close fd in
+      return_unit)
+    (function
+      | Unix.Unix_error (Unix.EBADF, _, _) ->
+          let*! () = Events.(emit warn_non_opened_file_descriptor ()) in
+          return_unit
+      | Unix.Unix_error (unix_code, caller, arg) ->
+          tzfail
+            (Lwt_utils_unix.Io_error {action = `Close; unix_code; caller; arg})
+      | exn -> Lwt.reraise exn)
+
+let init ~lru_size ~root_dir =
+  let open Lwt_result_syntax in
+  let*! () =
+    if not (Sys.file_exists root_dir) then Lwt_utils_unix.create_dir root_dir
+    else Lwt.return_unit
+  in
+  with_lockfile_lock (Filename.concat root_dir ".lock") @@ fun fd ->
+  return {files = Files.init ~lru_size; root_dir; lockfile = fd}
+
+let close t =
+  let open Lwt_result_syntax in
+  let*! () = Files.close t.files in
+  lockfile_unlock t.lockfile
 
 let write_value :
     type file key value.
     ?override:bool ->
     (file, key, value) t ->
+    (file, key, value) file_layout ->
     file ->
     key ->
     value ->
     unit tzresult Lwt.t =
- fun ?override {files; layout_of} file key value ->
-  let layout = layout_of file in
+ fun ?override {files; root_dir; _} file_layout file key value ->
+  let layout = file_layout ~root_dir file in
   Files.write ?override files layout key value
 
 let read_value :
     type file key value.
-    (file, key, value) t -> file -> key -> value tzresult Lwt.t =
- fun {files; layout_of} file key ->
-  let layout = layout_of file in
+    (file, key, value) t ->
+    (file, key, value) file_layout ->
+    file ->
+    key ->
+    value tzresult Lwt.t =
+ fun {files; root_dir; _} file_layout file key ->
+  let layout = file_layout ~root_dir file in
   Files.read files layout key
 
 let value_exists :
     type file key value.
-    (file, key, value) t -> file -> key -> bool tzresult Lwt.t =
- fun {files; layout_of} file key ->
-  let layout = layout_of file in
+    (file, key, value) t ->
+    (file, key, value) file_layout ->
+    file ->
+    key ->
+    bool tzresult Lwt.t =
+ fun {files; root_dir; _} file_layout file key ->
+  let layout = file_layout ~root_dir file in
   Files.value_exists files layout key
 
 let count_values :
-    type file key value. (file, key, value) t -> file -> int tzresult Lwt.t =
- fun {files; layout_of} file ->
-  let layout = layout_of file in
+    type file key value.
+    (file, key, value) t ->
+    (file, key, value) file_layout ->
+    file ->
+    int tzresult Lwt.t =
+ fun {files; root_dir; _} file_layout file ->
+  let layout = file_layout ~root_dir file in
   Files.count_values files layout
 
-let write_values ?override t seq =
+let write_values ?override t file_layout seq =
   Seq.ES.iter
-    (fun (file, key, value) -> write_value ?override t file key value)
+    (fun (file, key, value) ->
+      write_value ?override t file_layout file key value)
     seq
 
-let read_values t seq =
+let read_values t file_layout seq =
   let open Lwt_syntax in
   Seq_s.of_seq seq
   |> Seq_s.S.map (fun (file, key) ->
-         let* maybe_value = read_value t file key in
+         let* maybe_value = read_value t file_layout file key in
          return (file, key, maybe_value))
 
-let values_exist t seq =
+let values_exist t file_layout seq =
   let open Lwt_syntax in
   Seq_s.of_seq seq
   |> Seq_s.S.map (fun (file, key) ->
-         let* maybe_value = value_exists t file key in
+         let* maybe_value = value_exists t file_layout file key in
          return (file, key, maybe_value))
 
-let remove_file {files; layout_of} file =
-  let layout = layout_of file in
+let remove_file {files; root_dir; _} file_layout file =
+  let layout = file_layout ~root_dir file in
   Files.remove files layout

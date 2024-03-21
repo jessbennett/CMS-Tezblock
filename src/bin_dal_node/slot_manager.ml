@@ -55,7 +55,21 @@ let () =
     ~pp:(fun ppf msg -> Format.fprintf ppf "%s" msg)
     Data_encoding.(obj1 (req "msg" string))
     (function Invalid_degree msg -> Some msg | _ -> None)
-    (fun msg -> Invalid_degree msg)
+    (fun msg -> Invalid_degree msg) ;
+  register_error_kind
+    `Permanent
+    ~id:"dal.node.no_prover_srs"
+    ~title:"No prover SRS"
+    ~description:"The prover SRS has not been loaded."
+    ~pp:(fun ppf _ ->
+      Format.fprintf
+        ppf
+        "The prover SRS must be loaded before using proving functions. Change \
+         the current profile of your DAL node to slot producer or observer to \
+         be able to compute proofs.")
+    Data_encoding.empty
+    (function No_prover_SRS -> Some () | _ -> None)
+    (fun () -> No_prover_SRS)
 
 (* Used wrapper functions on top of Cryptobox. *)
 
@@ -134,40 +148,40 @@ let add_commitment_shards ~shards_proofs_precomputation node_store cryptobox
         shards)
   in
   if with_proof then
-    let shard_proofs =
-      Cryptobox.prove_shards
-        cryptobox
-        ~polynomial
-        ~precomputation:shards_proofs_precomputation
+    let*? precomputation =
+      match shards_proofs_precomputation with
+      | None -> Error (`Other [No_prover_SRS])
+      | Some precomputation -> Ok precomputation
     in
-    Store.Legacy.save_shard_proofs node_store commitment shard_proofs |> return
+    let shard_proofs =
+      Cryptobox.prove_shards cryptobox ~polynomial ~precomputation
+    in
+    Store.save_shard_proofs node_store commitment shard_proofs |> return
   else return_unit
 
 let get_opt array i =
   if i >= 0 && i < Array.length array then Some array.(i) else None
 
-(** [shards_to_attesters committee] takes a committee [Committee_cache.committee]
-      and returns a function that, given a shard index, yields the pkh of its
-      attester for that level. *)
+module IndexMap = Map.Make (struct
+  type t = int
+
+  let compare = compare
+end)
+
+(** [shards_to_attesters committee] takes a committee
+    [Committee_cache.committee] and returns a function that, given a shard
+    index, yields the pkh of its attester for that level. *)
 let shards_to_attesters committee =
-  let rec do_n ~n f acc = if n <= 0 then acc else do_n ~n:(n - 1) f (f acc) in
   let to_array committee =
-    (* We transform the map to a list *)
-    Tezos_crypto.Signature.Public_key_hash.Map.bindings committee
-    (* We sort the list in decreasing order w.r.t. to start_indices. *)
-    |> List.fast_sort (fun (_pkh1, shard_indices1) (_pkh2, shard_indices2) ->
-           shard_indices2.Committee_cache.start_index
-           - shard_indices1.Committee_cache.start_index)
-       (* We fold on the sorted list, starting from bigger start_indices. *)
-    |> List.fold_left
-         (fun accu (pkh, Committee_cache.{start_index = _; offset}) ->
-           (* We put in the accu list as many [pkh] occurrences as the number
-              of shards this pkh should attest, namely, [offset]. *)
-           do_n ~n:offset (fun acc -> pkh :: acc) accu)
-         []
-    (* We build an array from the list. The array indices coincide with shard
-       indices. *)
-    |> Array.of_list
+    Tezos_crypto.Signature.Public_key_hash.Map.fold
+      (fun pkh indexes index_map ->
+        List.fold_left
+          (fun index_map index -> IndexMap.add index pkh index_map)
+          index_map
+          indexes)
+      committee
+      IndexMap.empty
+    |> IndexMap.bindings |> List.map snd |> Array.of_list
   in
   let committee = to_array committee in
   fun index -> get_opt committee index

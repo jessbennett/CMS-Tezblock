@@ -53,7 +53,7 @@ let slot_of_int_e ~number_of_slots n =
 let pkh_of_consensus_key (consensus_key : Consensus_key.pk) =
   consensus_key.delegate
 
-let validate_attestation ctxt level consensus_key attestation =
+let validate_attestation ctxt level slot consensus_key attestation =
   let open Lwt_result_syntax in
   let*? () = assert_dal_feature_enabled ctxt in
   let number_of_slots = Dal.number_of_slots ctxt in
@@ -65,71 +65,17 @@ let validate_attestation ctxt level consensus_key attestation =
       Compare.Int.(size <= maximum_size)
       (Dal_attestation_size_limit_exceeded {maximum_size; got = size})
   in
-  let attester = pkh_of_consensus_key consensus_key in
+  let number_of_shards = Dal.number_of_shards ctxt in
   fail_when
-    (Option.is_none @@ Dal.Attestation.shards_of_attester ctxt ~attester)
-    (Dal_data_availibility_attester_not_in_committee {attester; level})
+    Compare.Int.(Slot.to_int slot >= number_of_shards)
+    (let attester = pkh_of_consensus_key consensus_key in
+     Dal_data_availibility_attester_not_in_committee {attester; level; slot})
 
-let validate_dal_attestation ctxt get_consensus_key_and_round_opt op =
-  let open Lwt_result_syntax in
-  let*? () = assert_dal_feature_enabled ctxt in
-  (* DAL/TODO: https://gitlab.com/tezos/tezos/-/issues/4462
-     Reconsider the ordering of checks. *)
-  let Dal.Attestation.{attestation; level = given; round; slot = _} = op in
-  let number_of_slots = Dal.number_of_slots ctxt in
-  let*? max_index = number_of_slots - 1 |> slot_of_int_e ~number_of_slots in
-  let maximum_size = Dal.Attestation.expected_size_in_bits ~max_index in
-  let size = Dal.Attestation.occupied_size_in_bits attestation in
-  let*? () =
-    error_unless
-      Compare.Int.(size <= maximum_size)
-      (Dal_attestation_size_limit_exceeded {maximum_size; got = size})
-  in
-  let current = Level.(current ctxt).level in
-  let*? expected =
-    match Raw_level.pred current with
-    | None -> error Dal_unexpected_attestation_at_root_level
-    | Some level -> Result_syntax.return level
-  in
-  let delta_levels = Raw_level.diff expected given in
-  let*? () =
-    error_when
-      Compare.Int32.(delta_levels > 0l)
-      (Dal_operation_for_old_level {expected; given})
-  in
-  let*? () =
-    error_when
-      Compare.Int32.(delta_levels < 0l)
-      (Dal_operation_for_future_level {expected; given})
-  in
-  let* consensus_key, round_opt = get_consensus_key_and_round_opt () in
-  let* () =
-    match round_opt with
-    | Some expected ->
-        fail_when
-          (not (Round.equal expected round))
-          (Dal_attestation_for_wrong_round {expected; given = round})
-    | None -> return_unit
-  in
-  let attester = pkh_of_consensus_key consensus_key in
-  let*? () =
-    error_when
-      (Option.is_none @@ Dal.Attestation.shards_of_attester ctxt ~attester)
-      (Dal_data_availibility_attester_not_in_committee
-         {attester; level = expected})
-  in
-  return consensus_key
-
-let apply_attestation ctxt consensus_key level attestation =
+let apply_attestation ctxt attestation ~power =
   let open Result_syntax in
   let* () = assert_dal_feature_enabled ctxt in
-  let attester = pkh_of_consensus_key consensus_key in
-  match Dal.Attestation.shards_of_attester ctxt ~attester with
-  | None ->
-      (* This should not happen: operation validation should have failed. *)
-      error (Dal_data_availibility_attester_not_in_committee {attester; level})
-  | Some shards ->
-      return (Dal.Attestation.record_attested_shards ctxt attestation shards)
+  return
+    (Dal.Attestation.record_number_of_attested_shards ctxt attestation power)
 
 (* This function should fail if we don't want the operation to be
    propagated over the L1 gossip network. Because this is a manager
@@ -138,17 +84,17 @@ let apply_attestation ctxt consensus_key level attestation =
    checks that cannot fail unless the source of the operation is
    malicious (or if there is a bug). In that case, it is better to
    ensure fees will be taken. *)
-let validate_publish_slot_header ctxt _operation =
+let validate_publish_commitment ctxt _operation =
   assert_dal_feature_enabled ctxt
 
-let apply_publish_slot_header ctxt operation =
+let apply_publish_commitment ctxt operation =
   let open Result_syntax in
-  let* ctxt = Gas.consume ctxt Dal_costs.cost_Dal_publish_slot_header in
+  let* ctxt = Gas.consume ctxt Dal_costs.cost_Dal_publish_commitment in
   let number_of_slots = Dal.number_of_slots ctxt in
   let* ctxt, cryptobox = Dal.make ctxt in
   let current_level = (Level.current ctxt).level in
   let* slot_header =
-    Dal.Operations.Publish_slot_header.slot_header
+    Dal.Operations.Publish_commitment.slot_header
       ~cryptobox
       ~number_of_slots
       ~current_level
@@ -161,7 +107,7 @@ let finalisation ctxt =
   let open Lwt_result_syntax in
   only_if_dal_feature_enabled
     ctxt
-    ~default:(fun ctxt -> return (ctxt, None))
+    ~default:(fun ctxt -> return (ctxt, Dal.Attestation.empty))
     (fun ctxt ->
       let*! ctxt = Dal.Slot.finalize_current_slot_headers ctxt in
       (* The fact that slots confirmation is done at finalization is very
@@ -179,41 +125,8 @@ let finalisation ctxt =
          - disallow proofs involving pages of slots that have been confirmed at the
            level where the game started.
       *)
-      let+ ctxt, attestation = Dal.Slot.finalize_pending_slot_headers ctxt in
-      (ctxt, Some attestation))
-
-let compute_committee ctxt level =
-  let open Lwt_result_syntax in
-  let*? () = assert_dal_feature_enabled ctxt in
-  let blocks_per_epoch = (Constants.parametric ctxt).dal.blocks_per_epoch in
-  let first_level_in_epoch =
-    match
-      Level.sub
-        ctxt
-        level
-        (Int32.to_int @@ Int32.rem level.Level.cycle_position blocks_per_epoch)
-    with
-    | Some v -> v
-    | None ->
-        (* unreachable, because level.level >= level.cycle_position >=
-           (level.cycle_position mod blocks_per_epoch) *)
-        assert false
-  in
-  let pkh_from_tenderbake_slot slot =
-    let+ ctxt, consensus_key =
-      Stake_distribution.slot_owner ctxt first_level_in_epoch slot
-    in
-    (ctxt, pkh_of_consensus_key consensus_key)
-  in
-  (* This committee is cached because it is the one we will use
-     for the validation of the DAL attestations. *)
-  Alpha_context.Dal.Attestation.compute_committee ctxt pkh_from_tenderbake_slot
-
-let initialisation ctxt ~level =
-  let open Lwt_result_syntax in
-  only_if_dal_feature_enabled
-    ctxt
-    ~default:(fun ctxt -> return ctxt)
-    (fun ctxt ->
-      let+ committee = compute_committee ctxt level in
-      Alpha_context.Dal.Attestation.init_committee ctxt committee)
+      let number_of_slots = (Constants.parametric ctxt).dal.number_of_slots in
+      let+ ctxt, attestation =
+        Dal.Slot.finalize_pending_slot_headers ctxt ~number_of_slots
+      in
+      (ctxt, attestation))

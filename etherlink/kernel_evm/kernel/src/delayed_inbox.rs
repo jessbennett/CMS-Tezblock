@@ -2,20 +2,28 @@
 // SPDX-FileCopyrightText: 2024 Trilitech <contact@trili.tech>
 
 use crate::{
+    current_timestamp,
+    event::Event,
     inbox::{Deposit, Transaction, TransactionContent},
     linked_list::LinkedList,
+    storage,
 };
 use anyhow::Result;
 use rlp::{Decodable, DecoderError, Encodable};
 use tezos_ethereum::{
-    transaction::TRANSACTION_HASH_SIZE, tx_common::EthereumTransactionCommon,
+    rlp_helpers, transaction::TRANSACTION_HASH_SIZE, tx_common::EthereumTransactionCommon,
 };
 use tezos_evm_logging::{log, Level::*};
+use tezos_smart_rollup_encoding::timestamp::Timestamp;
 use tezos_smart_rollup_host::{path::RefPath, runtime::Runtime};
 
-pub struct DelayedInbox(LinkedList<Hash, DelayedTransaction>);
+pub struct DelayedInbox(LinkedList<Hash, DelayedInboxItem>);
 
-pub const DELAYED_INBOX_PATH: RefPath = RefPath::assert_from(b"/delayed-inbox");
+pub const DELAYED_INBOX_PATH: RefPath = RefPath::assert_from(b"/evm/delayed-inbox");
+
+// Maximum number of transaction included in a blueprint when
+// forcing timed-out transactions from the delayed inbox.
+pub const MAX_DELAYED_INBOX_BLUEPRINT_LENGTH: usize = 1000;
 
 // Tag that indicates the delayed transaction is a eth transaction.
 pub const DELAYED_TRANSACTION_TAG: u8 = 0x01;
@@ -26,8 +34,8 @@ pub const DELAYED_DEPOSIT_TAG: u8 = 0x02;
 /// Hash of a transaction
 ///
 /// It represents the key of the transaction in the delayed inbox.
-#[derive(Clone, Copy, Debug)]
-pub struct Hash([u8; TRANSACTION_HASH_SIZE]);
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hash(pub [u8; TRANSACTION_HASH_SIZE]);
 
 impl Encodable for Hash {
     fn rlp_append(&self, s: &mut rlp::RlpStream) {
@@ -52,8 +60,6 @@ impl AsRef<[u8]> for Hash {
 }
 
 /// Delayed transaction
-/// Later it might be turned into a struct
-/// And fields like the timestamp might be added
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum DelayedTransaction {
@@ -91,6 +97,7 @@ impl Decodable for DelayedTransaction {
             DELAYED_TRANSACTION_TAG => {
                 let payload: Vec<u8> = payload.as_val()?;
                 let delayed_tx = EthereumTransactionCommon::from_bytes(&payload)?;
+
                 Ok(Self::Ethereum(delayed_tx))
             }
             DELAYED_DEPOSIT_TAG => {
@@ -99,6 +106,51 @@ impl Decodable for DelayedTransaction {
             }
             _ => Err(DecoderError::Custom("unknown tag")),
         }
+    }
+}
+
+// Elements in the delayed inbox
+#[derive(Clone)]
+pub struct DelayedInboxItem {
+    pub transaction: DelayedTransaction,
+    timestamp: Timestamp,
+    level: u32,
+}
+
+impl DelayedInboxItem {
+    fn list_size() -> usize {
+        3
+    }
+}
+
+impl Encodable for DelayedInboxItem {
+    fn rlp_append(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(Self::list_size());
+        stream.append(&self.transaction);
+        rlp_helpers::append_timestamp(stream, self.timestamp);
+        rlp_helpers::append_u32_le(stream, &self.level);
+    }
+}
+
+impl Decodable for DelayedInboxItem {
+    fn decode(decoder: &rlp::Rlp) -> Result<Self, DecoderError> {
+        if !decoder.is_list() {
+            return Err(DecoderError::RlpExpectedToBeList);
+        }
+        if decoder.item_count()? != Self::list_size() {
+            return Err(DecoderError::RlpIncorrectListLen);
+        }
+        let mut it = decoder.iter();
+        let transaction =
+            rlp_helpers::decode_field(&rlp_helpers::next(&mut it)?, "transaction")?;
+        let timestamp = rlp_helpers::decode_timestamp(&rlp_helpers::next(&mut it)?)?;
+        let level =
+            rlp_helpers::decode_field_u32_le(&rlp_helpers::next(&mut it)?, "level")?;
+        Ok(Self {
+            transaction,
+            timestamp,
+            level,
+        })
     }
 }
 
@@ -112,13 +164,24 @@ impl DelayedInbox {
         &mut self,
         host: &mut Host,
         tx: Transaction,
+        timestamp: Timestamp,
+        level: u32,
     ) -> Result<()> {
-        let Transaction { tx_hash, content } = tx;
-        let delayed_transaction = match content {
-            TransactionContent::Ethereum(tx) => DelayedTransaction::Ethereum(tx),
+        let Transaction { tx_hash, content } = tx.clone();
+        let transaction = match content {
+            TransactionContent::Ethereum(_) => anyhow::bail!("Non-delayed evm transaction should not be saved to the delayed inbox. {:?}", tx.tx_hash),
+            TransactionContent::EthereumDelayed(tx) => DelayedTransaction::Ethereum(tx),
             TransactionContent::Deposit(deposit) => DelayedTransaction::Deposit(deposit),
         };
-        self.0.push(host, &Hash(tx_hash), &delayed_transaction)?;
+        let item = DelayedInboxItem {
+            transaction,
+            timestamp,
+            level,
+        };
+
+        Event::NewDelayedTransaction(Box::new(tx)).store(host)?;
+
+        self.0.push(host, &Hash(tx_hash), &item)?;
         log!(
             host,
             Info,
@@ -128,29 +191,149 @@ impl DelayedInbox {
         Ok(())
     }
 
+    pub fn transaction_from_delayed(
+        tx_hash: Hash,
+        delayed: DelayedTransaction,
+    ) -> Transaction {
+        match delayed {
+            DelayedTransaction::Ethereum(tx) => Transaction {
+                tx_hash: tx_hash.0,
+                content: TransactionContent::EthereumDelayed(tx),
+            },
+            DelayedTransaction::Deposit(deposit) => Transaction {
+                tx_hash: tx_hash.0,
+                content: TransactionContent::Deposit(deposit),
+            },
+        }
+    }
+
     pub fn find_and_remove_transaction<Host: Runtime>(
         &mut self,
         host: &mut Host,
         tx_hash: Hash,
-    ) -> Result<Option<Transaction>> {
+    ) -> Result<Option<(Transaction, Timestamp)>> {
         log!(
             host,
             Info,
             "Removing transaction {} from the delayed inbox",
             hex::encode(tx_hash)
         );
-        let tx = self.0.remove(host, &tx_hash)?.map(|delayed| match delayed {
-            DelayedTransaction::Ethereum(tx) => Transaction {
-                tx_hash: tx_hash.0,
-                content: TransactionContent::Ethereum(tx),
+        let tx = self.0.remove(host, &tx_hash)?.map(
+            |DelayedInboxItem {
+                 transaction,
+                 timestamp,
+                 level: _,
+             }| {
+                (
+                    Self::transaction_from_delayed(tx_hash, transaction),
+                    timestamp,
+                )
             },
-            DelayedTransaction::Deposit(deposit) => Transaction {
-                tx_hash: tx_hash.0,
-                content: TransactionContent::Deposit(deposit),
-            },
-        });
+        );
 
         Ok(tx)
+    }
+
+    // Returns the oldest tx in the delayed inbox (and its hash) if it
+    // timed out
+    fn first_if_timed_out<Host: Runtime>(
+        &mut self,
+        host: &mut Host,
+        now: Timestamp,
+        timeout: u64,
+        current_level: u32,
+        min_levels: u32,
+    ) -> Result<Option<(Hash, DelayedTransaction)>> {
+        let to_pop = self.0.first_with_id(host)?.and_then(
+            |(
+                tx_hash,
+                DelayedInboxItem {
+                    transaction,
+                    timestamp,
+                    level,
+                },
+            )| {
+                if now.as_u64() - timestamp.as_u64() >= timeout
+                    && current_level - level >= min_levels
+                {
+                    log!(
+                        host,
+                        Info,
+                        "Delayed transaction {} timed out",
+                        hex::encode(tx_hash)
+                    );
+                    Some((tx_hash, transaction))
+                } else {
+                    None
+                }
+            },
+        );
+        Ok(to_pop)
+    }
+
+    #[cfg(test)]
+    pub fn is_empty<Host: Runtime>(&self, host: &mut Host) -> Result<bool> {
+        let first = self.0.first_with_id(host)?;
+        Ok(first.is_none())
+    }
+
+    fn pop_first<Host: Runtime>(
+        &mut self,
+        host: &mut Host,
+    ) -> Result<Option<Transaction>> {
+        let to_pop = self.0.first_with_id(host)?;
+        match to_pop {
+            None => Ok(None),
+            Some((hash, delayed)) => {
+                let _ = self.0.remove(host, &hash)?;
+                let transaction =
+                    Self::transaction_from_delayed(hash, delayed.transaction);
+                Ok(Some(transaction))
+            }
+        }
+    }
+
+    /// Returns whether the oldest tx in the delayed inbox has timed out.
+    pub fn first_has_timed_out<Host: Runtime>(
+        &mut self,
+        host: &mut Host,
+    ) -> Result<bool> {
+        let now = current_timestamp(host);
+        let timeout = storage::delayed_inbox_timeout(host)?;
+        let current_level = storage::read_l1_level(host)?;
+        let min_levels = storage::delayed_inbox_min_levels(host)?;
+        let popped =
+            self.first_if_timed_out(host, now, timeout, current_level, min_levels)?;
+        Ok(popped.is_some())
+    }
+
+    /// Computes the next vector of timed-out delayed transactions.
+    /// If there are no timed-out transactions, None is returned to
+    /// signal that we're done.
+    /// Note that this function assumes we're on a "timeout" state,
+    /// which should be checked before calling it.
+    pub fn next_delayed_inbox_blueprint<Host: Runtime>(
+        &mut self,
+        host: &mut Host,
+    ) -> Result<Option<Vec<Transaction>>> {
+        let mut popped: Vec<Transaction> = vec![];
+        while let Some(tx) = self.pop_first(host)? {
+            popped.push(tx);
+            // Check if the number of transactions has reached the limit per
+            // blueprint
+            if popped.len() >= MAX_DELAYED_INBOX_BLUEPRINT_LENGTH {
+                break;
+            }
+        }
+        Ok(if popped.is_empty() {
+            None
+        } else {
+            Some(popped)
+        })
+    }
+
+    pub fn delete<Host: Runtime>(&mut self, host: &mut Host) -> Result<()> {
+        self.0.delete(host)
     }
 }
 
@@ -158,10 +341,12 @@ impl DelayedInbox {
 mod tests {
     use super::DelayedInbox;
     use super::Hash;
+    use crate::current_timestamp;
     use crate::inbox::Transaction;
     use primitive_types::{H160, U256};
+    use tezos_smart_rollup_encoding::timestamp::Timestamp;
 
-    use crate::inbox::TransactionContent::Ethereum;
+    use crate::inbox::TransactionContent::{Ethereum, EthereumDelayed};
     use tezos_ethereum::{
         transaction::TRANSACTION_HASH_SIZE, tx_common::EthereumTransactionCommon,
     };
@@ -177,7 +362,7 @@ mod tests {
         EthereumTransactionCommon::new(
             tezos_ethereum::transaction::TransactionType::Legacy,
             Some(U256::one()),
-            U256::from(i),
+            i,
             U256::from(40000000u64),
             U256::from(40000000u64),
             21000u64,
@@ -192,7 +377,7 @@ mod tests {
     fn dummy_transaction(i: u8) -> Transaction {
         Transaction {
             tx_hash: [i; TRANSACTION_HASH_SIZE],
-            content: Ethereum(tx_(i.into())),
+            content: EthereumDelayed(tx_(i.into())),
         }
     }
 
@@ -203,17 +388,36 @@ mod tests {
             DelayedInbox::new(&mut host).expect("Delayed inbox should be created");
 
         let tx: Transaction = dummy_transaction(0);
+
+        let timestamp: Timestamp = current_timestamp(&mut host);
         delayed_inbox
-            .save_transaction(&mut host, tx.clone())
+            .save_transaction(&mut host, tx.clone(), timestamp, 0)
             .expect("Tx should be saved in the delayed inbox");
 
         let mut delayed_inbox =
             DelayedInbox::new(&mut host).expect("Delayed inbox should exist");
 
-        let read_tx = delayed_inbox
+        let read = delayed_inbox
             .find_and_remove_transaction(&mut host, Hash(tx.tx_hash))
             .expect("Reading from the delayed inbox should work")
             .expect("Transaction should be in the delayed inbox");
-        assert_eq!(tx, read_tx)
+        assert_eq!((tx, timestamp), read)
+    }
+
+    #[test]
+    fn test_delayed_inbox_roundtrip_error_non_delayed() {
+        let mut host = MockHost::default();
+        let mut delayed_inbox =
+            DelayedInbox::new(&mut host).expect("Delayed inbox should be created");
+
+        let tx: Transaction = Transaction {
+            tx_hash: [12; TRANSACTION_HASH_SIZE],
+            content: Ethereum(tx_(12)),
+        };
+
+        let timestamp: Timestamp = current_timestamp(&mut host);
+        let res = delayed_inbox.save_transaction(&mut host, tx, timestamp, 0);
+
+        assert!(res.is_err());
     }
 }

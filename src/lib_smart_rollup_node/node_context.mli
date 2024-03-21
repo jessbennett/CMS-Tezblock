@@ -27,7 +27,7 @@
 
 (** This module describes the execution context of the node. *)
 
-type lcc = {commitment : Commitment.Hash.t; level : int32}
+type lcc = Store.Lcc.lcc = {commitment : Commitment.Hash.t; level : int32}
 
 type genesis_info = Metadata.genesis_info = {
   level : int32;
@@ -61,6 +61,8 @@ module Node_store : sig
     'a store ->
     Configuration.history_mode option ->
     unit tzresult Lwt.t
+
+  val of_store : 'a Store.t -> 'a store
 end
 
 type debug_logger = string -> unit Lwt.t
@@ -83,6 +85,12 @@ type private_info = {
           when looking at whitelist update to execute. This is to
           reduce the folding call at each cementation. If the rollup
           is public then it's None. *)
+}
+
+type sync_info = {
+  on_synchronized : unit Lwt_condition.t;
+  mutable processed_level : int32;
+  sync_level_input : int32 Lwt_watcher.input;
 }
 
 type 'a t = {
@@ -126,6 +134,7 @@ type 'a t = {
   global_block_watcher : Sc_rollup_block.t Lwt_watcher.input;
       (** Watcher for the L2 chain, which enables RPC services to access
           a stream of L2 blocks. *)
+  sync : sync_info;  (** Synchronization status with respect to the L1 node.  *)
 }
 
 (** Read/write node context {!t}. *)
@@ -519,18 +528,6 @@ val save_slot_status :
 (* TODO: https://gitlab.com/tezos/tezos/-/issues/4636
    Missing docstrings. *)
 
-val find_confirmed_slots_history :
-  _ t -> Block_hash.t -> Dal.Slot_history.t option tzresult Lwt.t
-
-val save_confirmed_slots_history :
-  rw -> Block_hash.t -> Dal.Slot_history.t -> unit tzresult Lwt.t
-
-val find_confirmed_slots_histories :
-  _ t -> Block_hash.t -> Dal.Slot_history_cache.t option tzresult Lwt.t
-
-val save_confirmed_slots_histories :
-  rw -> Block_hash.t -> Dal.Slot_history_cache.t -> unit tzresult Lwt.t
-
 (** [gc node_ctxt level] triggers garbage collection for the node in accordance
     with [node_ctxt.config.gc_parameters]. Upon completion, all data for L2
     levels lower than [level] will be removed. *)
@@ -559,6 +556,17 @@ val make_kernel_logger :
   ?log_kernel_debug_file:string ->
   string ->
   ((string -> unit Lwt.t) * (unit -> unit Lwt.t)) Lwt.t
+
+(** {2 Synchronization tracking} *)
+
+(** [is_synchronized node_ctxt] returns [true] iff the rollup node has processed
+    the latest available L1 head. *)
+val is_synchronized : _ t -> bool
+
+(** [wait_synchronized node_ctxt] is a promise that resolves when the rollup
+    node whose state is [node_ctxt] is synchronized with L1. If the node is
+    already synchronized, it resolves immediately. *)
+val wait_synchronized : _ t -> unit Lwt.t
 
 module Internal_for_tests : sig
   val write_protocols_in_store :

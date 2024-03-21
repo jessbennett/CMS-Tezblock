@@ -38,16 +38,15 @@ let version_of_string = function
   | "1" -> Ok Version_1
   | _ -> Error "Cannot parse version (supported versions \"0\" and \"1\")"
 
-let default_operations_version = Version_0
+let default_operations_version = Version_1
 
 let version_arg =
   let open RPC_arg in
   make
     ~descr:
-      "Supported RPC versions are version '0' (default but deprecated) that \
-       will output attestation operations as \"endorsement\" in the \"kind\" \
-       field and version '1' that will output \"attestation\" in the \"kind\" \
-       field"
+      "Supported RPC versions are version '1' (default) that will output \
+       \"attestation\" in the \"kind\" field and version '0' (deprecated) that \
+       will output \"endorsement\""
     ~name:"version"
     ~destruct:version_of_string
     ~construct:string_of_version
@@ -780,14 +779,16 @@ module Scripts = struct
           (fun () ->
             let exp_ty = Script_ir_unparser.serialize_ty_for_error exp_ty in
             Script_tc_errors.Ill_typed_data (None, data, exp_ty))
-          (let allow_forged =
+          (let allow_forged_tickets = true in
+           let allow_forged_lazy_storage_id =
              true
              (* Safe since we ignore the value afterwards. *)
            in
            Script_ir_translator.parse_data
              ctxt
              ~elab_conf:(elab_conf ~legacy ())
-             ~allow_forged
+             ~allow_forged_tickets
+             ~allow_forged_lazy_storage_id
              exp_ty
              (Micheline.root data))
       in
@@ -909,7 +910,8 @@ module Scripts = struct
               Script_ir_translator.parse_data
                 ctxt
                 ~elab_conf
-                ~allow_forged:true
+                ~allow_forged_tickets:true
+                ~allow_forged_lazy_storage_id:true
                 ty
                 data_node
             in
@@ -1141,8 +1143,7 @@ module Scripts = struct
     let*? () =
       match packed_operation.protocol_data with
       | Operation_data {contents = Single (Preattestation _); _}
-      | Operation_data {contents = Single (Attestation _); _}
-      | Operation_data {contents = Single (Dal_attestation _); _} ->
+      | Operation_data {contents = Single (Attestation _); _} ->
           Environment.Error_monad.Result_syntax.tzfail
             Run_operation_does_not_support_consensus_operations
       | _ -> Result_syntax.return_unit
@@ -1289,7 +1290,8 @@ module Scripts = struct
               parse_data
                 ctxt
                 ~elab_conf:(Script_ir_translator_config.make ~legacy:false ())
-                ~allow_forged:true
+                ~allow_forged_tickets:true
+                ~allow_forged_lazy_storage_id:true
                 map_ty
                 items
             in
@@ -1778,7 +1780,8 @@ module Scripts = struct
         let* storage, _ =
           Script_ir_translator.parse_data
             ~elab_conf
-            ~allow_forged:true
+            ~allow_forged_tickets:true
+            ~allow_forged_lazy_storage_id:true
             ctxt
             storage_type
             (Micheline.root storage)
@@ -1828,7 +1831,8 @@ module Scripts = struct
           parse_data
             ctxt
             ~elab_conf:(elab_conf ~legacy:true ())
-            ~allow_forged:true
+            ~allow_forged_tickets:true
+            ~allow_forged_lazy_storage_id:true
             typ
             (Micheline.root expr)
         in
@@ -1855,7 +1859,8 @@ module Scripts = struct
           parse_data
             ctxt
             ~elab_conf:(elab_conf ~legacy ())
-            ~allow_forged:true
+            ~allow_forged_tickets:true
+            ~allow_forged_lazy_storage_id:true
             typ
             (Micheline.root expr)
         in
@@ -2348,7 +2353,8 @@ module Contract = struct
               parse_script
                 ctxt
                 ~elab_conf:(elab_conf ~legacy:true ())
-                ~allow_forged_in_storage:true
+                ~allow_forged_tickets_in_storage:true
+                ~allow_forged_lazy_storage_id_in_storage:true
                 script
             in
             let+ storage, _ctxt =
@@ -2370,7 +2376,8 @@ module Contract = struct
               Script_ir_translator.parse_and_unparse_script_unaccounted
                 ctxt
                 ~legacy:true
-                ~allow_forged_in_storage:true
+                ~allow_forged_tickets_in_storage:true
+                ~allow_forged_lazy_storage_id_in_storage:true
                 unparsing_mode
                 ~normalize_types
                 script
@@ -2417,7 +2424,8 @@ module Contract = struct
               Script_ir_translator.parse_script
                 ctxt
                 ~elab_conf:(elab_conf ~legacy:true ())
-                ~allow_forged_in_storage:true
+                ~allow_forged_tickets_in_storage:true
+                ~allow_forged_lazy_storage_id_in_storage:true
                 script
             in
             let*? has_tickets, ctxt =
@@ -2538,7 +2546,8 @@ module Big_map = struct
                   parse_data
                     ctxt
                     ~elab_conf:(elab_conf ~legacy:true ())
-                    ~allow_forged:true
+                    ~allow_forged_tickets:true
+                    ~allow_forged_lazy_storage_id:true
                     value_type
                     (Micheline.root value)
                 in
@@ -3101,65 +3110,156 @@ module Sc_rollup = struct
     RPC_context.make_call1 S.ticket_balance ctxt block sc_rollup () key
 end
 
+type Environment.Error_monad.error +=
+  | Published_slot_headers_not_initialized of Raw_level.t
+
+let () =
+  Environment.Error_monad.register_error_kind
+    `Permanent
+    ~id:"published_slot_headers_not_initialized"
+    ~title:"The published slot headers bucket not initialized in the context"
+    ~description:
+      "The published slot headers bucket is not initialized in the context"
+    ~pp:(fun ppf level ->
+      Format.fprintf
+        ppf
+        "The published slot headers bucket is not initialized in the context \
+         at level %a"
+        Raw_level.pp
+        level)
+    Data_encoding.(obj1 (req "level" Raw_level.encoding))
+    (function
+      | Published_slot_headers_not_initialized level -> Some level | _ -> None)
+    (fun level -> Published_slot_headers_not_initialized level)
+
 module Dal = struct
   let path : RPC_context.t RPC_path.context =
     RPC_path.(open_root / "context" / "dal")
 
   module S = struct
-    let dal_confirmed_slot_headers_history =
+    let dal_commitments_history =
       let output = Data_encoding.option Dal.Slots_history.encoding in
       let query = RPC_query.(seal @@ query ()) in
       RPC_service.get_service
         ~description:
-          "Returns the value of the DAL confirmed slots history skip list if \
-           DAL is enabled, or [None] otherwise."
+          "Returns the (currently last) DAL skip list cell if DAL is enabled, \
+           or [None] otherwise."
         ~output
         ~query
-        RPC_path.(path / "confirmed_slot_headers_history")
+        RPC_path.(path / "commitments_history")
 
-    let shards_query =
+    let level_query =
       RPC_query.(
         query (fun level -> level)
         |+ opt_field "level" Raw_level.rpc_arg (fun t -> t)
         |> seal)
 
+    type shards_query = {
+      level : Raw_level.t option;
+      delegates : Signature.Public_key_hash.t list;
+    }
+
+    let shards_query =
+      let open RPC_query in
+      query (fun level delegates -> {level; delegates})
+      |+ opt_field "level" Raw_level.rpc_arg (fun t -> t.level)
+      |+ multi_field "delegates" Signature.Public_key_hash.rpc_arg (fun t ->
+             t.delegates)
+      |> seal
+
+    type shards_assignment = {
+      delegate : Signature.Public_key_hash.t;
+      indexes : int list;
+    }
+
+    let shards_assignment_encoding =
+      let open Data_encoding in
+      conv
+        (fun {delegate; indexes} -> (delegate, indexes))
+        (fun (delegate, indexes) -> {delegate; indexes})
+        (obj2
+           (req "delegate" Signature.Public_key_hash.encoding)
+           (req "indexes" (list int16)))
+
+    type shards_output = shards_assignment list
+
     let shards =
       RPC_service.get_service
         ~description:
-          "Get the shard assignements for a given level (the default is the \
-           current level)"
+          "Get the shards assignment for a given level (the default is the \
+           current level) and given delegates (the default is all delegates)"
         ~query:shards_query
-        ~output:
-          Data_encoding.(
-            list (tup2 Signature.Public_key_hash.encoding (tup2 int16 int16)))
+        ~output:(Data_encoding.list shards_assignment_encoding)
         RPC_path.(path / "shards")
+
+    let published_slot_headers =
+      let output = Data_encoding.(list Dal.Slot.Header.encoding) in
+      RPC_service.get_service
+        ~description:"Get the published slots headers for the given level"
+        ~query:level_query
+        ~output
+        RPC_path.(path / "published_slot_headers")
   end
 
-  let register_dal_confirmed_slot_headers_history () =
+  let register_dal_commitments_history () =
     let open Lwt_result_syntax in
     Registration.register0
       ~chunked:false
-      S.dal_confirmed_slot_headers_history
+      S.dal_commitments_history
       (fun ctxt () () ->
         if (Constants.parametric ctxt).dal.feature_enable then
           let+ result = Dal.Slots_storage.get_slot_headers_history ctxt in
           Option.some result
         else return_none)
 
-  let dal_confirmed_slots_history ctxt block =
-    RPC_context.make_call0 S.dal_confirmed_slot_headers_history ctxt block () ()
+  let dal_commitments_history ctxt block =
+    RPC_context.make_call0 S.dal_commitments_history ctxt block () ()
 
-  let dal_shards ctxt block ?level () =
-    RPC_context.make_call0 S.shards ctxt block level ()
+  let dal_shards ctxt block ?level ?(delegates = []) () =
+    RPC_context.make_call0 S.shards ctxt block {level; delegates} ()
 
   let register_shards () =
-    Registration.register0 ~chunked:true S.shards @@ fun ctxt level () ->
+    Registration.register0 ~chunked:true S.shards @@ fun ctxt q () ->
+    let open Lwt_result_syntax in
+    let*? level_opt =
+      Option.map_e (Level.from_raw_with_offset ctxt ~offset:0l) q.level
+    in
+    let level = Option.value level_opt ~default:(Level.current ctxt) in
+    let* _ctxt, map = Dal_services.shards ctxt ~level in
+    let query_delegates = Signature.Public_key_hash.Set.of_list q.delegates in
+    let all_delegates =
+      Signature.Public_key_hash.Set.is_empty query_delegates
+    in
+    Signature.Public_key_hash.Map.fold
+      (fun delegate indexes acc ->
+        if
+          all_delegates
+          || Signature.Public_key_hash.Set.mem delegate query_delegates
+        then ({delegate; indexes} : S.shards_assignment) :: acc
+        else acc)
+      map
+      []
+    |> return
+
+  let dal_published_slot_headers ctxt block ?level () =
+    RPC_context.make_call0 S.published_slot_headers ctxt block level ()
+
+  let register_published_slot_headers () =
+    let open Lwt_result_syntax in
+    Registration.register0 ~chunked:true S.published_slot_headers
+    @@ fun ctxt level () ->
     let level = Option.value level ~default:(Level.current ctxt).level in
-    Dal_services.shards ctxt ~level
+    let* result = Dal.Slot.find_slot_headers ctxt level in
+    match result with
+    | Some l -> return l
+    | None ->
+        Environment.Error_monad.tzfail
+        @@ Published_slot_headers_not_initialized level
 
   let register () =
-    register_dal_confirmed_slot_headers_history () ;
-    register_shards ()
+    register_dal_commitments_history () ;
+    register_shards () ;
+    register_published_slot_headers ()
 end
 
 module Forge = struct
@@ -3231,7 +3331,7 @@ module Forge = struct
       (fun () operation ->
         return
           (Data_encoding.Binary.to_bytes_exn
-             Operation.unsigned_encoding_with_legacy_attestation_name
+             Operation.unsigned_encoding
              operation)) ;
     Registration.register0_noctxt
       ~chunked:true
@@ -3468,7 +3568,7 @@ module Parse = struct
     let open Result_syntax in
     match
       Data_encoding.Binary.of_bytes_opt
-        Operation.protocol_data_encoding_with_legacy_attestation_name
+        Operation.protocol_data_encoding
         op.proto
     with
     | Some protocol_data -> return {shell = op.shell; protocol_data}
@@ -3778,7 +3878,7 @@ module Attestation_rights = struct
     estimated_time : Time.t option;
   }
 
-  let delegate_rights_encoding use_legacy_attestation_name =
+  let delegate_rights_encoding =
     let open Data_encoding in
     conv
       (fun {delegate; consensus_key; first_slot; attestation_power} ->
@@ -3788,13 +3888,10 @@ module Attestation_rights = struct
       (obj4
          (req "delegate" Signature.Public_key_hash.encoding)
          (req "first_slot" Slot.encoding)
-         (req
-            (if use_legacy_attestation_name then "endorsing_power"
-            else "attestation_power")
-            uint16)
+         (req "attestation_power" uint16)
          (req "consensus_key" Signature.Public_key_hash.encoding))
 
-  let encoding ~use_legacy_attestation_name =
+  let encoding =
     let open Data_encoding in
     conv
       (fun {level; delegates_rights; estimated_time} ->
@@ -3803,17 +3900,13 @@ module Attestation_rights = struct
         {level; delegates_rights; estimated_time})
       (obj3
          (req "level" Raw_level.encoding)
-         (req
-            "delegates"
-            (list (delegate_rights_encoding use_legacy_attestation_name)))
+         (req "delegates" (list delegate_rights_encoding))
          (opt "estimated_time" Timestamp.encoding))
 
   module S = struct
     open Data_encoding
 
     let attestation_path = RPC_path.(path / "attestation_rights")
-
-    let endorsing_path = RPC_path.(path / "endorsing_rights")
 
     type attestation_rights_query = {
       levels : Raw_level.t list;
@@ -3853,34 +3946,8 @@ module Attestation_rights = struct
            block's, based on the hypothesis that all predecessor blocks were \
            baked at the first round."
         ~query:attestation_rights_query
-        ~output:(list (encoding ~use_legacy_attestation_name:false))
+        ~output:(list encoding)
         attestation_path
-
-    (* TODO: https://gitlab.com/tezos/tezos/-/issues/5156
-       endorsing_rights RPC should be removed once the depreciation period
-       will be over *)
-    let endorsing_rights =
-      RPC_service.get_service
-        ~description:
-          "Deprecated: use `attestation_rights` instead.\n\
-           Retrieves the delegates allowed to endorse a block.\n\
-           By default, it gives the endorsing power for delegates that have at \
-           least one endorsing slot for the next block.\n\
-           Parameters `level` and `cycle` can be used to specify the (valid) \
-           level(s) in the past or future at which the endorsing rights have \
-           to be returned. Parameter `delegate` can be used to restrict the \
-           results to the given delegates.\n\
-           Parameter `consensus_key` can be used to restrict the results to \
-           the given consensus_keys. \n\
-           Returns the smallest endorsing slots and the endorsing power. Also \
-           returns the minimal timestamp that corresponds to endorsing at the \
-           given level. The timestamps are omitted for levels in the past, and \
-           are only estimates for levels higher that the next block's, based \
-           on the hypothesis that all predecessor blocks were baked at the \
-           first round."
-        ~query:attestation_rights_query
-        ~output:(list (encoding ~use_legacy_attestation_name:true))
-        endorsing_path
   end
 
   let attestation_rights_at_level ctxt level =
@@ -3907,7 +3974,8 @@ module Attestation_rights = struct
                  consensus_pk = _;
                  consensus_pkh = consensus_key;
                },
-               attestation_power )
+               attestation_power,
+               _dal_power )
              acc ->
           {delegate; consensus_key; first_slot; attestation_power} :: acc)
         rights
@@ -3951,8 +4019,6 @@ module Attestation_rights = struct
 
   let register () =
     Registration.register0 ~chunked:true S.attestation_rights (fun ctxt q () ->
-        get_attestation_rights ctxt q) ;
-    Registration.register0 ~chunked:true S.endorsing_rights (fun ctxt q () ->
         get_attestation_rights ctxt q)
 
   let get ctxt ?(levels = []) ?cycle ?(delegates = []) ?(consensus_keys = [])
@@ -4102,6 +4168,15 @@ module Staking = struct
         ~query:RPC_query.empty
         ~output:stakers_encoding
         RPC_path.(path / "stakers")
+
+    let is_forbidden =
+      RPC_service.get_service
+        ~description:
+          "Returns true if the delegate is forbidden to participate in \
+           consensus."
+        ~query:RPC_query.empty
+        ~output:Data_encoding.bool
+        RPC_path.(path / "is_forbidden")
   end
 
   let contract_stake ctxt ~delegator_contract ~delegate =
@@ -4129,7 +4204,13 @@ module Staking = struct
     if result then return_unit
     else Environment.Error_monad.tzfail (Delegate_services.Not_registered pkh)
 
+  let check_is_forbidden ctxt pkh =
+    let open Lwt_result_syntax in
+    return @@ Delegate.is_forbidden_delegate ctxt pkh
+
   let register () =
+    Registration.register1 ~chunked:false S.is_forbidden (fun ctxt pkh () () ->
+        check_is_forbidden ctxt pkh) ;
     Registration.register1 ~chunked:true S.stakers (fun ctxt pkh () () ->
         let open Lwt_result_syntax in
         let* () = check_delegate_registered ctxt pkh in
